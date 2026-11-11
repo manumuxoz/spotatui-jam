@@ -1,0 +1,21 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node / relay
+node_modules/
+worker-relay/.wrangler/
+worker-relay/dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Local
+.env
+*.local

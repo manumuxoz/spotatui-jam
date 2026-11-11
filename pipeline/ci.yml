@@ -1,0 +1,193 @@
+# Plantilla de CI para el fork spotatui-jam.
+# Copiar a .github/workflows/ci.yml y ajustar nombres/features al fork.
+# Las acciones deben fijarse por SHA en producción; aquí se usan tags por legibilidad.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Ajustar a la feature set real del fork.
+  PARTY_FEATURES: "telemetry,tui,streaming,mcp-server,scripting,local-files,subsonic,internet-radio,youtube,qobuz"
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            args: "--locked"
+          - name: slim
+            args: "--locked --no-default-features --features telemetry,tui"
+          - name: party
+            args: "--locked --no-default-features --features telemetry,tui,streaming"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y -qq pkg-config libssl-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libpipewire-0.3-dev libspa-0.2-dev libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy ${{ matrix.args }} -- -D warnings
+
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            args: "--locked"
+          - name: party
+            args: "--locked --no-default-features --features telemetry,tui,streaming"
+          - name: headless
+            args: "--locked --no-default-features --features telemetry"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y -qq pkg-config libssl-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libpipewire-0.3-dev libspa-0.2-dev libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test ${{ matrix.args }}
+
+  party-protocol:
+    name: Party protocol
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit + property + golden tests
+        run: "cargo test --locked party:: -- --nocapture"
+      - name: Snapshot chunk size
+        run: "cargo test --locked party::chunk::tests::worst_case_chunk_fits -- --exact"
+      - name: Fuzz smoke
+        run: |
+          cargo install cargo-fuzz --locked
+          cargo fuzz run parse_sync_message -- -runs=10000
+
+  party-sim:
+    name: Party simulation (8 guests)
+    runs-on: ubuntu-latest
+    needs: [party-protocol]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --locked --bin party-sim -- --guests 8 --ops 10000 --seed 42
+      - run: cargo run --locked --bin party-sim -- --guests 8 --ops 10000 --seed 7
+
+  relay:
+    name: Relay (Worker)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker-relay
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: worker-relay/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npx tsc --noEmit
+      - run: npx wrangler deploy --dry-run --env staging
+
+  relay-integration:
+    name: Relay integration
+    runs-on: ubuntu-latest
+    needs: [relay]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Start local relay
+        working-directory: worker-relay
+        run: |
+          npm ci
+          npm install -g wait-on
+          npx wrangler dev --local --port 8787 &
+          wait-on http://127.0.0.1:8787/healthz --timeout 60000
+      - name: Integration tests
+        env:
+          PARTY_RELAY_URL: ws://127.0.0.1:8787/ws
+        run: cargo test --locked --test party_relay -- --nocapture
+
+  tui:
+    name: TUI snapshots
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked party_ui -- --nocapture
+        env:
+          INSTA_UPDATE: "no"
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-audit
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo audit
+      - run: cargo deny check licenses bans sources
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lycheeverse/lychee-action@v2
+        with:
+          args: --no-progress --offline "docs/**/*.md" "README.md" "research/**/*.md"
+
+  msrv:
+    name: MSRV (1.90)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --no-default-features --features telemetry,tui
