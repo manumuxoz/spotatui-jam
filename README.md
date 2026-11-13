@@ -2,7 +2,7 @@
 
 Extensión de [spotatui](https://github.com/LargeModGames/spotatui) para convertir su **Listening Party** en una jam real: reproducción sincronizada **y una cola compartida** que todos los participantes pueden ver y modificar.
 
-> **Estado:** Fase 0 — investigación y planificación. Este repositorio contiene el plan, la arquitectura, el pipeline y el backlog; todavía no hay código de producción.
+> **Estado:** MVP implementado y probado sobre spotatui 0.48.0. El fork vive en `work/spotatui` (rama `feat/party-queue`, commit `4bb9ee2`) y el parche exportado está en [`patches/0001-party-queue.patch`](patches/0001-party-queue.patch). Incluye cola autoritativa, protocolo v2, relay Rust y Worker, UI TUI y tests. Ver [`docs/10-implementation-status.md`](docs/10-implementation-status.md).
 
 ---
 
@@ -79,18 +79,25 @@ spotatui-jam/
 │   ├── 06-riesgos.md             ← registro de riesgos y mitigaciones
 │   ├── 07-adr/                   ← decisiones arquitectónicas
 │   ├── 08-backlog.md             ← épicas, historias y criterios de aceptación
-│   └── 09-operacion.md           ← relay, despliegue, observabilidad
+│   ├── 09-operacion.md           ← relay, despliegue, observabilidad
+│   └── 10-implementation-status.md ← qué está hecho, pruebas y deuda
 ├── research/
 │   ├── 00-sintesis.md            ← conclusión de la investigación
 │   ├── 01-spotatui-architecture.md
 │   ├── 02-existing-projects.md
 │   └── 03-technical-feasibility.md
+├── party-relay/                  ← relay Rust auto-hospedable (crate independiente)
+├── patches/
+│   └── 0001-party-queue.patch    ← parche aplicable a spotatui v0.48.0
 ├── pipeline/
 │   ├── ci.yml                    ← GitHub Actions (PR)
 │   ├── nightly.yml               ← fuzz, soak, load
 │   └── release.yml               ← artefactos + relay
+├── scripts/
+│   └── smoke-party.mjs           ← create/join/add/ack/patch contra un relay
 └── plan/
     ├── checklist-fase-0.md       ← qué validar antes de escribir código
+    ├── decision-fase-0.md        ← plantilla de decisión del gate G0
     └── definicion-de-hecho.md
 ```
 
@@ -113,11 +120,26 @@ El detalle, incluyendo matrices, gates y rollback, está en [`docs/04-pipeline.m
 
 ---
 
+## Cómo probarlo ahora
+
+```bash
+# Relay Rust
+cd party-relay && cargo run --release
+
+# spotatui, en otra terminal
+cd work/spotatui
+cargo build --locked --no-default-features --features telemetry,tui,streaming
+./target/debug/spotatui
+```
+
+Configura `behavior.relay_server_url: "ws://127.0.0.1:8080/ws"`. Host: `Ctrl+P` → crear. Invitado: `Ctrl+P` → unirse. `Q` abre la cola; `/` busca; `z` añade; `x` quita; `J/K` mueve; `Enter` pone ahora.
+
 ## Siguiente paso
 
-1. Revisar [`docs/02-arquitectura.md`](docs/02-arquitectura.md) y [`docs/01-vision-producto.md`](docs/01-vision-producto.md); confirmar o corregir las decisiones D1–D6.
-2. Ejecutar la Fase 0 siguiendo [`plan/checklist-fase-0.md`](plan/checklist-fase-0.md): reproducir Listening Party con relay local, medir límites y hacer los spikes de protocolo y `native_queue`.
-3. Celebrar el gate G0: si los spikes pasan, empezar la Fase 1 (protocolo y cola) con el backlog [`docs/08-backlog.md`](docs/08-backlog.md).
+1. Leer [`docs/10-implementation-status.md`](docs/10-implementation-status.md): qué está hecho, qué falta y qué pruebas pasan.
+2. Probar con dos cuentas Spotify Premium en la misma LAN (el audio real no se puede validar en CI).
+3. Revisar el parche y decidir upstream vs fork.
+4. Completar P1: votos, i18n, paridad GUI, reconexión y despliegue del Worker.
 
 ## Supuestos de trabajo
 

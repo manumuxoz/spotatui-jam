@@ -161,7 +161,7 @@ Latencia: el relay local no debe añadir > 10 ms p95.
 
 ## 6. E2E simulados
 
-`party-sim` es un binario de test que:
+La integración real host/guest se ejecuta con tests ignorados contra un relay vivo. Un simulador de 8 invitados sin audio (`party-sim`) queda como P1; los tests actuales cubren el camino completo con dos Apps y un relay real:
 
 - Arranca un relay local (o se conecta a uno).
 - Crea 1 host y N invitados.
@@ -303,7 +303,7 @@ Revisión manual antes de release:
 
 | Métrica | Objetivo | Cómo se mide |
 |---|---|---|
-| Add → patch visible | p95 < 500 ms LAN, < 1 s WAN | `party-sim`, timestamp |
+| Add → patch visible | p95 < 500 ms LAN, < 1 s WAN | tests de integración, timestamp |
 | Patch → UI render | < 16 ms | tick de 60 fps |
 | Snapshot 100 items | < 100 ms | benchmark |
 | Memoria host (100 items) | < 2 MB extra | RSS |

@@ -82,11 +82,16 @@ cargo test --locked --no-default-features --features telemetry,tui,streaming
 # Solo la cola (rápido, sin audio)
 cargo test --locked party::
 
-# Relay local
+# Relay local (Rust, sin wrangler)
+cd party-relay && cargo test && cargo run --release
+
+# Relay local (Worker)
 cd worker-relay && npm ci && npm test && npx wrangler dev --local
 
-# Simulación host + 8 invitados
-cargo run --locked --bin party-sim -- --guests 8 --ops 1000
+# Integración real host + guest contra el relay
+PARTY_RELAY_URL=ws://127.0.0.1:8080/ws \
+  cargo test --locked --no-default-features --features telemetry,tui,streaming \
+  -- --ignored
 
 # UI snapshots
 cargo test --locked --features tui party_ui
@@ -110,8 +115,8 @@ test-party:
 relay-dev:
 	cd worker-relay && npx wrangler dev --local
 
-sim:
-	cargo run --locked --bin party-sim -- --guests 8 --ops 1000
+integration:
+	PARTY_RELAY_URL=ws://127.0.0.1:8080/ws cargo test --locked -- --ignored
 
 ci: fmt lint test test-party
 ```
@@ -130,12 +135,12 @@ No se instala `just` como dependencia obligatoria; es azúcar. Los comandos `car
 | `fmt` | `cargo fmt --all -- --check` | Sí |
 | `clippy` | Matriz de features (default, slim, all-sources, headless) con `-D warnings` | Sí |
 | `test` | Matriz de features; incluye tests de party | Sí |
-| `party-protocol` | Golden JSON, property tests, fuzz smoke 60 s, chunk size | Sí |
-| `party-sim` | Host + 8 invitados, 10k ops, 3 semillas | Sí |
+| `party-protocol` | Golden JSON, property tests, chunk size | Sí |
+| `party-integration` | Host + guest reales contra el relay, add/ack/patch | Sí |
 | `compat` | Matriz old/new de cliente y relay | Sí |
 | `tui-snapshots` | `insta` snapshots a 80×24/120×40/200×60 | Sí |
 | `relay` | `npm ci`, typecheck, tests, `wrangler deploy --dry-run` | Sí |
-| `relay-integration` | Relay local + 2 clientes WebSocket | Sí |
+| `relay-rust` | `fmt`, `clippy`, tests del crate `party-relay`, smoke del protocolo | Sí |
 | `security` | `cargo audit`, `cargo deny`, `cargo vet` (si se adopta) | Sí |
 | `docs` | Link check, spellcheck, TOC | No bloqueante (warning) |
 | `coverage` | `cargo llvm-cov`, subida a Codecov | No bloqueante |
@@ -194,7 +199,7 @@ Los binarios 0.48 se pueden obtener del release de GitHub en CI; si no, se simul
 
 | Job | Frecuencia | Qué hace | Alerta |
 |---|---|---|---|
-| `fuzz` | diario | 1 h por target, corpus en caché | Issue automático |
+| `fuzz` | P1 | 1 h por target, corpus en caché | Issue automático |
 | `soak` | diario | 1 h, host + 8 invitados simulados, red con 50–300 ms de latencia | Issue |
 | `load-relay` | semanal | 100 salas × 8 clientes, 10 min | Issue |
 | `upstream-sync` | diario | Fetch de `LargeModGames/spotatui`, intento de rebase, conflicto → issue | Issue |

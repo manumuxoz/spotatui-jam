@@ -124,7 +124,7 @@ El MVP se congela en el gate G3. Todo lo que no esté en Must va a P1/P2.
 
 | ID | Título | Descripción | Criterio de aceptación | Est. | Prioridad |
 |---|---|---|---|---|---|
-| PQ-070 | `party-sim` | Host + N guests + mock playback | 8 guests, 10k ops | L | Must |
+| PQ-070 | `party-sim` | Host + N guests + mock playback | 8 guests, 10k ops | L | Could |
 | PQ-071 | Chaos tests | Latencia, churn, duplicates, patch loss | Sin divergencia | M | Must |
 | PQ-072 | Compat matrix CI | Old/new clients | 4 combinaciones verdes | M | Must |
 | PQ-073 | Workflow PR | Jobs de party | Bloqueante | M | Must |

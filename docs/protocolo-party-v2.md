@@ -3,6 +3,7 @@
 Especificación de los mensajes que extienden Listening Party. Es aditiva: ningún mensaje v1 cambia de forma o de significado. El relay v2 los reenvía; el host es la autoridad de la cola.
 
 - **Versión:** 2
+- **Implementación de referencia:** `src/core/party/queue.rs`, `src/infra/network/sync.rs`, `src/infra/network/mod.rs`, `party-relay/` y `worker-relay/`.
 - **Transporte:** WebSocket, mensajes de texto JSON, uno por frame.
 - **Límite duro:** 4.096 bytes por mensaje en el relay de referencia. El emisor debe medir el JSON serializado antes de enviar.
 - **Codificación:** UTF-8. Los strings de metadata se truncan a 120 caracteres en el wire.
@@ -185,13 +186,14 @@ Reglas:
 
 ### 3.5 `queue_command`
 
-Invitado → host. El relay añade `from` y descarta el que envíe el cliente.
+Invitado → host. El relay añade `from` (nombre) y `from_id` (id de sesión), y descarta los que envíe el cliente.
 
 ```json
 {
   "type": "queue_command",
   "op_id": "3f1c9a0e-...",
-  "from": "p-7f3a",
+  "from": "ana",
+  "from_id": "p-7f3a",
   "base_rev": 42,
   "action": {
     "op": "add",
@@ -262,13 +264,13 @@ Códigos de error:
 
 ### 3.7 `queue_resync`
 
-Invitado → host. Petición de snapshot.
+Invitado → host. Petición de snapshot. El relay añade `from`/`from_id` igual que en `queue_command`.
 
 ```json
 { "type": "queue_resync", "have_revision": 40 }
 ```
 
-El host responde con `queue_snapshot` dirigido (`to`) y la revisión actual.
+El host responde con `queue_snapshot` dirigido (`to`) y la revisión actual. El cliente pide resync al detectar un `queue_patch` con una revisión no contigua; el ensamblador también debe expirar a los 5 s si falta un chunk.
 
 ### 3.8 `sync_state` (v1, sin cambios)
 

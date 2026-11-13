@@ -23,6 +23,29 @@ if (!relayUrl) {
 
 const TIMEOUT_MS = 10_000;
 
+let WebSocketCtor = globalThis.WebSocket;
+
+async function resolveWebSocket() {
+  if (WebSocketCtor) return WebSocketCtor;
+  const { createRequire } = await import("node:module");
+  const { dirname, join } = await import("node:path");
+  const candidates = [
+    process.cwd(),
+    join(process.cwd(), "work/spotatui/worker-relay"),
+    join(dirname(process.cwd()), "work/spotatui/worker-relay"),
+  ];
+  for (const dir of candidates) {
+    try {
+      const require = createRequire(join(dir, "package.json"));
+      const mod = require("ws");
+      if (mod?.WebSocket) return mod.WebSocket;
+    } catch {
+      // try the next candidate
+    }
+  }
+  throw new Error("no WebSocket implementation; use Node 22+ or install ws");
+}
+
 function withTimeout(promise, label) {
   return Promise.race([
     promise,
@@ -35,7 +58,7 @@ function withTimeout(promise, label) {
 function connect(params) {
   const url = new URL(relayUrl);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
-  const ws = new WebSocket(url);
+  const ws = new WebSocketCtor(url);
   const inbox = [];
   const waiters = [];
 
@@ -85,6 +108,7 @@ function connect(params) {
 }
 
 async function main() {
+  WebSocketCtor = await resolveWebSocket();
   const host = connect({
     action: "create",
     v: "2",

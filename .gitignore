@@ -19,3 +19,7 @@ Thumbs.db
 # Local
 .env
 *.local
+
+# Working fork (not committed)
+/work/spotatui/
+/work/

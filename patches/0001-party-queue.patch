@@ -1,0 +1,4937 @@
+From 4bb9ee2496de2e0cac8a024a308c00014b4797aa Mon Sep 17 00:00:00 2001
+From: manumuxoz <manuel.munhozvazquez@gmail.com>
+Date: Fri, 13 Nov 2026 17:16:21 +0100
+Subject: [PATCH] feat(party): add host-authoritative collaborative queue
+
+- core queue model with current/items/history, permissions, limits and tests
+- protocol v2: queue snapshots, patches, commands, acks and resync
+- host/guest network integration with chunking and idempotency
+- TUI queue in the party popup and the existing Queue screen
+- relay v2 for Cloudflare Workers and a Rust self-hosted relay
+---
+ docs/listening-party.md           |   39 +-
+ src/core/action/tests.rs          |    5 +
+ src/core/app/construction.rs      |    1 +
+ src/core/app/mod.rs               |    2 +
+ src/core/app/party.rs             |   86 ++
+ src/core/app/queue.rs             |   68 ++
+ src/core/i18n/popups.rs           |   35 +
+ src/core/i18n/template_tests.rs   |   10 +
+ src/core/mod.rs                   |    3 +-
+ src/core/party/mod.rs             |   14 +
+ src/core/party/queue.rs           | 1323 +++++++++++++++++++++++++++++
+ src/gui/protocol.rs               |    5 +
+ src/infra/network/library.rs      |    6 +-
+ src/infra/network/mod.rs          |  749 +++++++++++++++-
+ src/infra/network/sync.rs         |  330 +++++++
+ src/tui/handlers/party.rs         |   36 +-
+ src/tui/handlers/queue_menu.rs    |   16 +-
+ src/tui/ui/popups.rs              |  239 +++++-
+ worker-relay/.gitignore           |    3 +
+ worker-relay/README.md            |  145 ++++
+ worker-relay/package-lock.json    |   64 +-
+ worker-relay/package.json         |    7 +-
+ worker-relay/src/index.ts         |  209 ++++-
+ worker-relay/src/routing.ts       |  225 +++++
+ worker-relay/test/routing.test.ts |  223 +++++
+ worker-relay/tsconfig.test.json   |   12 +
+ worker-relay/wrangler.toml        |   33 +
+ 27 files changed, 3741 insertions(+), 147 deletions(-)
+ create mode 100644 src/core/party/mod.rs
+ create mode 100644 src/core/party/queue.rs
+ create mode 100644 worker-relay/.gitignore
+ create mode 100644 worker-relay/README.md
+ create mode 100644 worker-relay/src/routing.ts
+ create mode 100644 worker-relay/test/routing.test.ts
+ create mode 100644 worker-relay/tsconfig.test.json
+
+diff --git a/docs/listening-party.md b/docs/listening-party.md
+index 5bf112d..cb50e1a 100644
+--- a/docs/listening-party.md
++++ b/docs/listening-party.md
+@@ -4,6 +4,8 @@ A **Listening Party** keeps the playback of a host and one or more guests in syn
+ 
+ Every participant needs a Spotify login, and Spotify in spotatui needs Premium. The party follows Spotify tracks only: while the host plays another source, the room stays open but the guests get nothing new.
+ 
++The party also has a **shared queue** (Party Queue v2). The host owns it; guests can add tracks and, depending on the room policy, remove or reorder them. The relay does not store the queue: it only routes revisioned snapshots and patches between the host and the guests.
++
+ ## Opening the party menu
+ 
+ Press `Ctrl+p` (the `listening_party` key) in the terminal app. The desktop app has a **Listening party** page.
+@@ -13,6 +15,7 @@ Press `Ctrl+p` (the `listening_party` key) in the terminal app. The desktop app
+ Press `1`, `h` or `Enter` to start a party. spotatui creates a room on the relay and shows a **6-character code**. Share it with your guests.
+ 
+ - Your track, position and play or pause state go to the guests every 2 seconds.
++- `Q` opens the shared queue on the existing Queue screen.
+ - `c` switches the control mode (below).
+ - `l` ends the party. `Esc` only closes the menu; the party keeps running.
+ 
+@@ -20,12 +23,37 @@ Press `1`, `h` or `Enter` to start a party. spotatui creates a room on the relay
+ 
+ Press `2` or `j`, type the 6-character code, then your display name (up to 32 characters), and press `Enter`. Your playback then follows the host. When your position drifts by more than about 3 seconds, spotatui seeks again, with the network delay taken into account. `l` leaves the party.
+ 
++## Shared queue
++
++The host is the only writer. Guests send intents; the host validates them and broadcasts the applied operations with a monotonic revision.
++
++- Add a track: search with `/`, select a track and press `z` (`add_item_to_queue`). It is sent to the host instead of the local queue.
++- Open the queue: `Q`. The existing Queue screen shows the shared queue while a party is active.
++- Remove: `x` on the selected row.
++- Reorder: `J` / `K`.
++- Play now: `Enter` (host only).
++- A guest without permission gets a status message and the queue does not change.
++
++Policies:
++
++| `queue_mode` | Guests can add | Guests can remove own | Guests can reorder |
++| --- | --- | --- | --- |
++| `host_only` | No | No | No |
++| `guests_add` (default) | Yes | No | No |
++| `guests_manage` | Yes | Yes | Yes |
++
++Defaults: 100 tracks, 5 pending tracks per guest, one add every 2 seconds, duplicate URIs rejected. The host can change the policy in `config.yml` (a UI for this is P1).
++
++Only `spotify:track:` URIs are accepted in v1. If the host is on an external Connect device, the queue cannot be authoritative; run the host on spotatui's own device.
++
+ ## Control modes
+ 
+ | Mode | Behavior |
+ | --- | --- |
+ | **Host only** (default) | Only the host controls playback; guests follow. |
+-| **Shared control** | The host accepts playback commands from guests. spotatui guests do not send any yet, so this changes nothing for them today. |
++| **Shared control** | The host accepts playback commands from guests: play, pause, next, previous and seek. |
++
++Queue permissions are independent of playback control: a room can let guests add tracks without letting them skip.
+ 
+ ## While a party runs
+ 
+@@ -39,3 +67,12 @@ The default relay is `wss://spotatui-party.spotatui.workers.dev/ws`. To use your
+ behavior:
+   relay_server_url: "wss://relay.example.com/ws"
+ ```
++
++The repository includes a Rust relay in `party-relay/` for LANs and self-hosting, and the Cloudflare Worker relay in `worker-relay/`. Both speak Party Queue v2. The Rust relay listens on `ws://127.0.0.1:8080/ws` by default.
++
++## Limits
++
++- 8 participants per room (host included).
++- 4 KB per WebSocket message; snapshots are chunked by byte budget.
++- The room closes when the host leaves and expires after 5 minutes without activity.
++- The queue lives in memory; it is not persisted after the party ends.
+diff --git a/src/core/action/tests.rs b/src/core/action/tests.rs
+index 4a1782d..c4e09e6 100644
+--- a/src/core/action/tests.rs
++++ b/src/core/action/tests.rs
+@@ -2552,9 +2552,14 @@ fn toggle_party_control_mode_flips_the_session_and_tells_the_relay() {
+     role: PartyRole::Host,
+     code: "ABC123".to_string(),
+     guests: Vec::new(),
++    members: Vec::new(),
++    participant_id: "host".to_string(),
++    self_name: "Host".to_string(),
+     control_mode: ControlMode::HostOnly,
+     host_name: "Host".to_string(),
+     host_state_at: None,
++    queue_revision: 0,
++    queue_enabled: true,
+   }));
+   let before = app.display_revisions().get(DisplayDomain::Party);
+ 
+diff --git a/src/core/app/construction.rs b/src/core/app/construction.rs
+index 870d808..b3050d0 100644
+--- a/src/core/app/construction.rs
++++ b/src/core/app/construction.rs
+@@ -172,6 +172,7 @@ impl Default for App {
+       status_message_is_error: false,
+       party_status: PartyStatus::default(),
+       party_session: None,
++      party_queue: crate::core::party::PartyQueue::default(),
+       pending_track_table_selection: None,
+       playlist_track_positions: None,
+       pending_playlist_track_add: None,
+diff --git a/src/core/app/mod.rs b/src/core/app/mod.rs
+index 06652b0..da478c1 100644
+--- a/src/core/app/mod.rs
++++ b/src/core/app/mod.rs
+@@ -519,6 +519,8 @@ pub struct App {
+   party_status: PartyStatus,
+   /// Active listening party session data
+   party_session: Option<PartySession>,
++  /// Host-authoritative collaborative queue (a mirror on guests).
++  party_queue: crate::core::party::PartyQueue,
+   /// Pending track table selection to apply when new page loads
+   pending_track_table_selection: Option<PendingTrackSelection>,
+   /// Maps visible track table rows to source playlist item positions.
+diff --git a/src/core/app/party.rs b/src/core/app/party.rs
+index 9f0c472..0ef61c0 100644
+--- a/src/core/app/party.rs
++++ b/src/core/app/party.rs
+@@ -3,6 +3,13 @@ use super::*;
+ /// The host sends its state every 2 s; a guest that heard none for longer stops relaying.
+ const HOST_STATE_FRESH: Duration = Duration::from_secs(5);
+ 
++fn party_now_ms() -> u64 {
++  std::time::SystemTime::now()
++    .duration_since(std::time::UNIX_EPOCH)
++    .unwrap_or_default()
++    .as_millis() as u64
++}
++
+ #[cfg(test)]
+ const PARTY_NEEDS_SPOTIFY: &str =
+   "Listening Party needs Spotify. Press `d` and pick Spotify to log in.";
+@@ -12,6 +19,74 @@ impl App {
+     &self.party_status
+   }
+ 
++  pub fn party_queue(&self) -> &crate::core::party::PartyQueue {
++    &self.party_queue
++  }
++
++  pub(crate) fn party_queue_mut(&mut self) -> &mut crate::core::party::PartyQueue {
++    &mut self.party_queue
++  }
++
++  pub(crate) fn reset_party_queue(&mut self) {
++    self.party_queue = crate::core::party::PartyQueue::default();
++    self.display_revisions.bump(DisplayDomain::Queue);
++  }
++
++  pub(crate) fn party_is_active(&self) -> bool {
++    self.party_session.is_some()
++  }
++
++  pub fn party_is_host(&self) -> bool {
++    self
++      .party_session
++      .as_ref()
++      .is_some_and(|session| session.role == PartyRole::Host)
++  }
++
++  /// Start the host queue from what is playing and what is already queued.
++  pub(crate) fn start_party_queue(&mut self) {
++    let host_name = self
++      .party_session
++      .as_ref()
++      .map(|session| session.host_name.clone())
++      .filter(|name| !name.is_empty())
++      .unwrap_or_else(|| "Host".to_string());
++    let host = crate::core::party::PartyMember::host(host_name);
++    let mut queue = crate::core::party::PartyQueue::with_host(Default::default(), host.clone());
++    let current = crate::core::plugin_api::playback_state(self).and_then(|state| state.track);
++    let queued = self.native_queue.clone();
++    queue.adopt(&host, current.as_ref(), &queued, party_now_ms());
++    queue.set_members(vec![host]);
++    self.party_queue = queue;
++    self.project_party_queue();
++  }
++
++  /// Replace the playable native queue with the party queue's upcoming items.
++  pub(crate) fn project_party_queue(&mut self) {
++    self.native_queue = self.party_queue.projected_tracks();
++  }
++
++  /// Record a playback transition into the party queue, returning the op a
++  /// host must broadcast. Guests never call this.
++  pub(crate) fn observe_party_playback(&mut self) -> Option<crate::core::party::QueueOp> {
++    let uri = crate::core::plugin_api::playback_state(self)
++      .and_then(|state| state.track)
++      .and_then(|track| track.uri)?;
++    let op = self.party_queue.observe_playback(&uri, party_now_ms())?;
++    self.project_party_queue();
++    Some(op)
++  }
++
++  /// Resolve a queue-screen row (URI + position) to the party item id.
++  pub(crate) fn party_item_id(&self, uri: &str, position: usize) -> Option<u64> {
++    let items = &self.party_queue.items;
++    items
++      .get(position)
++      .filter(|item| item.uri == uri)
++      .or_else(|| items.iter().find(|item| item.uri == uri))
++      .map(|item| item.id)
++  }
++
+   pub(crate) fn party_session(&self) -> Option<&PartySession> {
+     self.party_session.as_ref()
+   }
+@@ -75,6 +150,12 @@ impl App {
+   /// not drive the host's queue slot. A parked native backend has no Spotify
+   /// playback to relay or follow.
+   pub(crate) fn party_yields_to_local_playback(&self) -> bool {
++    // A queued Spotify track on the host is still Spotify playback: the party
++    // must keep publishing it. Decoded queue items, local sources and Apple
++    // Music remain unshareable.
++    if self.party_is_host() && self.queue_now_is_spotify() {
++      return false;
++    }
+     self.apple_music_owns_playback()
+       || self.playback_owner().owns_local_sink()
+       || self.native_parked_here()
+@@ -202,9 +283,14 @@ mod tests {
+       role,
+       code: "ABC123".to_string(),
+       guests: Vec::new(),
++      members: Vec::new(),
++      participant_id: "p-1".to_string(),
++      self_name: "Guest".to_string(),
+       control_mode,
+       host_name: "Host".to_string(),
+       host_state_at: Some(Instant::now()),
++      queue_revision: 0,
++      queue_enabled: true,
+     }));
+     (app, rx)
+   }
+diff --git a/src/core/app/queue.rs b/src/core/app/queue.rs
+index ff47883..2f1897a 100644
+--- a/src/core/app/queue.rs
++++ b/src/core/app/queue.rs
+@@ -47,6 +47,27 @@ impl App {
+       self.set_status_message(self.strings().status.app.music_cannot_queue, 3);
+       return;
+     }
++    // During a jam the host is the only writer. Guests send an intent; the
++    // host applies it and broadcasts the resulting patch. Only Spotify tracks
++    // can be shared with every participant in v1.
++    if self.party_is_active() {
++      if !self
++        .party_session()
++        .is_some_and(|session| session.supports_queue())
++      {
++        self.set_status_message(self.strings().popups.party_relay_no_queue, 4);
++        return;
++      }
++      if !crate::core::party::queue::is_spotify_track_uri(&uri) {
++        self.set_status_message(self.strings().popups.party_queue_only_spotify, 4);
++        return;
++      }
++      match crate::core::party::QueueAction::add(&track) {
++        Ok(action) => self.dispatch(IoEvent::PartyQueueCommand(action)),
++        Err(error) => self.set_status_message(error.message(), 4),
++      }
++      return;
++    }
+     // A Spotify track controlled on an external device has no native sink to
+     // play through, so fall back to the Spotify Web-API queue.
+     if matches!(
+@@ -102,6 +123,18 @@ impl App {
+       self.set_status_message(self.strings().status.app.music_cannot_queue, 4);
+       return;
+     }
++    if self.party_is_active() {
++      if !self.party_is_host() {
++        self.set_status_message(self.strings().popups.party_host_only_play_now, 4);
++        return;
++      }
++      if let Some(id) = self.party_item_id(uri, position) {
++        self.dispatch(IoEvent::PartyQueueCommand(
++          crate::core::party::QueueAction::PlayNow { id },
++        ));
++      }
++      return;
++    }
+     let Some(skip) = self.queue_position_for(uri, position) else {
+       return;
+     };
+@@ -121,6 +154,14 @@ impl App {
+ 
+   /// Remove one native-queue item; a no-op when it is not in the queue.
+   pub(crate) fn remove_queue_item(&mut self, uri: &str, position: usize) {
++    if self.party_is_active() {
++      if let Some(id) = self.party_item_id(uri, position) {
++        self.dispatch(IoEvent::PartyQueueCommand(
++          crate::core::party::QueueAction::Remove { id },
++        ));
++      }
++      return;
++    }
+     if let Some(idx) = self.queue_position_for(uri, position) {
+       self.native_queue.remove(idx);
+     }
+@@ -128,6 +169,27 @@ impl App {
+ 
+   /// Move one native-queue item to index `to`; a no-op when out of range.
+   pub(crate) fn move_queue_item(&mut self, uri: &str, from: usize, to: usize) {
++    if self.party_is_active() {
++      let items = &self.party_queue.items;
++      let Some(item) = items.get(from).filter(|item| item.uri == uri) else {
++        return;
++      };
++      if to >= items.len() {
++        return;
++      }
++      let id = item.id;
++      let after = if to == 0 {
++        None
++      } else if to > from {
++        items.get(to).map(|item| item.id)
++      } else {
++        items.get(to - 1).map(|item| item.id)
++      };
++      self.dispatch(IoEvent::PartyQueueCommand(
++        crate::core::party::QueueAction::Move { id, after },
++      ));
++      return;
++    }
+     let Some(from) = self.queue_position_for(uri, from) else {
+       return;
+     };
+@@ -140,6 +202,12 @@ impl App {
+ 
+   /// Empty the native queue; the playing slot and a suspended context stay.
+   pub(crate) fn clear_native_queue(&mut self) {
++    if self.party_is_active() {
++      self.dispatch(IoEvent::PartyQueueCommand(
++        crate::core::party::QueueAction::Clear,
++      ));
++      return;
++    }
+     self.native_queue.clear();
+   }
+ 
+diff --git a/src/core/i18n/popups.rs b/src/core/i18n/popups.rs
+index d1159e4..648f5f2 100644
+--- a/src/core/i18n/popups.rs
++++ b/src/core/i18n/popups.rs
+@@ -115,6 +115,15 @@ pub struct PopupStrings {
+   pub party_hosting_title: &'static str,
+   pub party_joined_title: &'static str,
+   pub party_title: &'static str,
++  pub party_queue_empty: &'static str,
++  pub party_queue_hint: &'static str,
++  pub party_queue_current_none: &'static str,
++  pub party_queue_title_template: &'static str,
++  pub party_queue_more_template: &'static str,
++  pub party_queue_only_spotify: &'static str,
++  pub party_relay_no_queue: &'static str,
++  pub party_host_only_play_now: &'static str,
++  pub party_action_failed: &'static str,
+   pub plugin_close_hint: &'static str,
+   pub fallback_session_only: &'static str,
+   pub create_playlist_title: &'static str,
+@@ -253,6 +262,15 @@ pub const EN: PopupStrings = PopupStrings {
+   party_hosting_title: "Party (Hosting)",
+   party_joined_title: "Party (Joined)",
+   party_title: "Party",
++  party_queue_empty: "The party queue is empty — search with / and press z to add",
++  party_queue_hint: "Q opens the queue · / search · z add · c control · l leave",
++  party_queue_current_none: "Nothing from the queue is playing",
++  party_queue_title_template: "Queue {revision} · {count} track(s)",
++  party_queue_more_template: "… and {count} more",
++  party_queue_only_spotify: "Party Queue only accepts Spotify tracks",
++  party_relay_no_queue: "This relay does not support the party queue",
++  party_host_only_play_now: "Only the host can play a track now",
++  party_action_failed: "The queue operation failed",
+   plugin_close_hint: "(Esc to close)",
+   fallback_session_only: "Using Alt+, for this session only",
+   create_playlist_title: "Create Playlist (Esc to cancel)",
+@@ -673,6 +691,23 @@ impl PopupStrings {
+     )
+   }
+ 
++  pub fn party_queue_title(&self, revision: u64, count: usize) -> String {
++    super::format_template(
++      self.party_queue_title_template,
++      &[
++        ("revision", &revision.to_string()),
++        ("count", &count.to_string()),
++      ],
++    )
++  }
++
++  pub fn party_queue_more(&self, count: usize) -> String {
++    super::format_template(
++      self.party_queue_more_template,
++      &[("count", &count.to_string())],
++    )
++  }
++
+   pub fn sort_field(&self, field: crate::core::sort::SortField) -> &'static str {
+     use crate::core::sort::SortField;
+     match field {
+diff --git a/src/core/i18n/template_tests.rs b/src/core/i18n/template_tests.rs
+index a004210..592eca9 100644
+--- a/src/core/i18n/template_tests.rs
++++ b/src/core/i18n/template_tests.rs
+@@ -382,6 +382,16 @@ fn every_typed_message_fills_its_placeholders_and_preserves_all_arguments() {
+       strings.popups.party_name_length(9101),
+       ["9101"]
+     );
++    check!(
++      "popups.party_queue_title",
++      strings.popups.party_queue_title(9101, 9102),
++      ["9101", "9102"]
++    );
++    check!(
++      "popups.party_queue_more",
++      strings.popups.party_queue_more(9101),
++      ["9101"]
++    );
+     check!("popups.listeners", strings.popups.listeners(9101), ["9101"]);
+     check!(
+       "popups.add_tracks_title",
+diff --git a/src/core/mod.rs b/src/core/mod.rs
+index 0f33c09..5e1130d 100644
+--- a/src/core/mod.rs
++++ b/src/core/mod.rs
+@@ -39,8 +39,9 @@ pub mod onboarding;
+ pub mod pagination;
+ #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+ pub mod pane;
+-pub mod paths;
+ #[cfg_attr(not(feature = "tui"), allow(dead_code))]
++pub mod party;
++pub mod paths;
+ pub mod persisted_playback;
+ pub mod playlist_sync;
+ pub mod plugin_api;
+diff --git a/src/core/party/mod.rs b/src/core/party/mod.rs
+new file mode 100644
+index 0000000..936b3b3
+--- /dev/null
++++ b/src/core/party/mod.rs
+@@ -0,0 +1,14 @@
++//! Host-authoritative collaborative queue for Listening Party.
++//!
++//! The relay is deliberately dumb: the host owns the queue and broadcasts
++//! revisioned snapshots/patches. Guests hold a mirror and send intents. All
++//! validation and ordering happens here, in the host's process.
++
++pub mod queue;
++
++#[allow(unused_imports)]
++pub use queue::{
++  PartyMember, PartyMemberRole, PartyPlaybackMode, PartyQueue, PartyQueueConfig, PartyQueueError,
++  PartyQueueItem, PartyQueueMode, PartyQueueSnapshot, PartyTrack, PlayedItem, QueueAck,
++  QueueAction, QueueCommand, QueueOp, QueuePatch, SnapshotAssembler,
++};
+diff --git a/src/core/party/queue.rs b/src/core/party/queue.rs
+new file mode 100644
+index 0000000..14cc83e
+--- /dev/null
++++ b/src/core/party/queue.rs
+@@ -0,0 +1,1323 @@
++//! Party-queue domain model.
++//!
++//! This module is deliberately frontend- and network-neutral: it owns the
++//! invariants, validation and replay rules. The host applies [`QueueAction`]s
++//! and broadcasts [`QueueOp`]s; a guest applies [`QueuePatch`]es or a chunked
++//! [`PartyQueueSnapshot`] and asks for a resync when a revision is missing.
++
++use std::collections::HashMap;
++
++use serde::{Deserialize, Serialize};
++
++use crate::core::plugin_api::TrackInfo;
++
++pub const DEFAULT_MAX_ITEMS: usize = 100;
++pub const DEFAULT_MAX_PER_GUEST: usize = 5;
++pub const DEFAULT_ADD_COOLDOWN_MS: u64 = 2_000;
++pub const MAX_TRACK_MS: u32 = 3_600_000;
++pub const HISTORY_LIMIT: usize = 50;
++
++/// Who may mutate the queue. This is independent of playback control.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum PartyQueueMode {
++  HostOnly,
++  #[default]
++  GuestsAdd,
++  GuestsManage,
++}
++
++/// Who actually reproduces the audio.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum PartyPlaybackMode {
++  #[default]
++  FollowHost,
++  HostOnly,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum PartyMemberRole {
++  Host,
++  Guest,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub struct PartyMember {
++  pub id: String,
++  pub name: String,
++  pub role: PartyMemberRole,
++}
++
++impl PartyMember {
++  pub fn host(name: impl Into<String>) -> Self {
++    Self {
++      id: "host".to_string(),
++      name: name.into(),
++      role: PartyMemberRole::Host,
++    }
++  }
++
++  pub fn guest(id: impl Into<String>, name: impl Into<String>) -> Self {
++    Self {
++      id: id.into(),
++      name: name.into(),
++      role: PartyMemberRole::Guest,
++    }
++  }
++
++  pub fn is_host(&self) -> bool {
++    self.role == PartyMemberRole::Host || self.id == "host"
++  }
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(default)]
++pub struct PartyQueueConfig {
++  pub queue_mode: PartyQueueMode,
++  pub playback_mode: PartyPlaybackMode,
++  pub max_items: usize,
++  pub max_per_guest: usize,
++  pub add_cooldown_ms: u64,
++  pub dedupe: bool,
++  pub allow_explicit: bool,
++  pub stop_when_empty: bool,
++  pub votes_enabled: bool,
++}
++
++impl Default for PartyQueueConfig {
++  fn default() -> Self {
++    Self {
++      queue_mode: PartyQueueMode::GuestsAdd,
++      playback_mode: PartyPlaybackMode::FollowHost,
++      max_items: DEFAULT_MAX_ITEMS,
++      max_per_guest: DEFAULT_MAX_PER_GUEST,
++      add_cooldown_ms: DEFAULT_ADD_COOLDOWN_MS,
++      dedupe: true,
++      allow_explicit: true,
++      stop_when_empty: false,
++      votes_enabled: false,
++    }
++  }
++}
++
++/// The wire-safe subset of a track. It never carries image URLs or full
++/// `TrackInfo`, keeping snapshots small enough for the 4 KB relay limit.
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub struct PartyTrack {
++  pub uri: String,
++  pub title: String,
++  pub artists: Vec<String>,
++  pub duration_ms: u32,
++}
++
++impl PartyTrack {
++  pub fn from_track_info(track: &TrackInfo, strict: bool) -> Result<Self, PartyQueueError> {
++    let uri = track
++      .uri
++      .clone()
++      .ok_or_else(|| PartyQueueError::new("invalid_uri", "El track no tiene URI de Spotify"))?;
++    if !is_spotify_track_uri(&uri) {
++      return Err(PartyQueueError::new(
++        "invalid_uri",
++        "Solo se admiten tracks `spotify:track:`",
++      ));
++    }
++    let title = sanitize(&track.name, 200);
++    if title.is_empty() {
++      return Err(PartyQueueError::new(
++        "invalid_metadata",
++        "El track no tiene título",
++      ));
++    }
++    let artists: Vec<String> = track
++      .artists
++      .iter()
++      .map(|a| sanitize(a, 200))
++      .filter(|a| !a.is_empty())
++      .take(8)
++      .collect();
++    if artists.is_empty() {
++      return Err(PartyQueueError::new(
++        "invalid_metadata",
++        "El track no tiene artista",
++      ));
++    }
++    let duration_ms = track.duration_ms.min(u32::MAX as u64) as u32;
++    if strict && (duration_ms == 0 || duration_ms > MAX_TRACK_MS) {
++      return Err(PartyQueueError::new(
++        "invalid_metadata",
++        "Duración fuera de rango",
++      ));
++    }
++    Ok(Self {
++      uri,
++      title,
++      artists,
++      duration_ms,
++    })
++  }
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub struct PartyQueueItem {
++  pub id: u64,
++  pub uri: String,
++  pub title: String,
++  pub artists: Vec<String>,
++  pub duration_ms: u32,
++  pub added_by: String,
++  pub added_by_name: String,
++  pub votes: i32,
++  pub added_at_ms: u64,
++}
++
++impl PartyQueueItem {
++  pub fn from_track(track: PartyTrack, id: u64, member: &PartyMember, now_ms: u64) -> Self {
++    Self {
++      id,
++      uri: track.uri,
++      title: track.title,
++      artists: track.artists,
++      duration_ms: track.duration_ms,
++      added_by: member.id.clone(),
++      added_by_name: member.name.clone(),
++      votes: 0,
++      added_at_ms: now_ms,
++    }
++  }
++
++  pub fn to_track_info(&self) -> TrackInfo {
++    TrackInfo {
++      uri: Some(self.uri.clone()),
++      name: self.title.clone(),
++      artists: self.artists.clone(),
++      album: String::new(),
++      duration_ms: self.duration_ms as u64,
++      id: None,
++      album_id: None,
++      artist_refs: Vec::new(),
++      is_playable: true,
++      is_local: false,
++      track_number: 0,
++      explicit: false,
++      image_url: None,
++      release_date: None,
++      generated_name: None,
++    }
++  }
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub struct PlayedItem {
++  pub item: PartyQueueItem,
++  pub played_at_ms: u64,
++  pub skipped: bool,
++}
++
++/// An intent from a participant. Guests send these; the host validates them.
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(tag = "op", rename_all = "snake_case")]
++pub enum QueueAction {
++  Add {
++    uri: String,
++    title: String,
++    artists: Vec<String>,
++    duration_ms: u32,
++  },
++  Remove {
++    id: u64,
++  },
++  Move {
++    id: u64,
++    after: Option<u64>,
++  },
++  Clear,
++  PlayNow {
++    id: u64,
++  },
++  Vote {
++    id: u64,
++    value: i8,
++  },
++}
++
++impl QueueAction {
++  pub fn add(track: &TrackInfo) -> Result<Self, PartyQueueError> {
++    let track = PartyTrack::from_track_info(track, true)?;
++    Ok(Self::Add {
++      uri: track.uri,
++      title: track.title,
++      artists: track.artists,
++      duration_ms: track.duration_ms,
++    })
++  }
++}
++
++/// An already-applied mutation broadcast by the host.
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(tag = "op", rename_all = "snake_case")]
++pub enum QueueOp {
++  Add {
++    item: PartyQueueItem,
++  },
++  Remove {
++    id: u64,
++  },
++  Move {
++    id: u64,
++    after: Option<u64>,
++  },
++  Clear,
++  Advance {
++    current: PartyQueueItem,
++    played_id: u64,
++    skipped: bool,
++  },
++  SetCurrent {
++    current: PartyQueueItem,
++    played_id: Option<u64>,
++    skipped: bool,
++  },
++  ClearCurrent,
++  Reset {
++    current: Option<PartyQueueItem>,
++    items: Vec<PartyQueueItem>,
++  },
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub struct QueueCommand {
++  pub op_id: String,
++  /// Display name of the sender, filled by the relay for a v1 relay.
++  #[serde(default)]
++  pub from: Option<String>,
++  /// Stable participant id, filled by a v2 relay.
++  #[serde(default)]
++  pub from_id: Option<String>,
++  pub base_rev: u64,
++  pub action: QueueAction,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub struct QueueAck {
++  pub op_id: String,
++  pub ok: bool,
++  #[serde(default, skip_serializing_if = "Option::is_none")]
++  pub error: Option<String>,
++  #[serde(default, skip_serializing_if = "Option::is_none")]
++  pub message: Option<String>,
++  pub revision: u64,
++  #[serde(default, skip_serializing_if = "Option::is_none")]
++  pub to: Option<String>,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub struct QueuePatch {
++  pub revision: u64,
++  pub ops: Vec<QueueOp>,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub struct PartyQueueSnapshot {
++  pub revision: u64,
++  pub snapshot_id: String,
++  pub chunk: u16,
++  pub chunks: u16,
++  #[serde(default, skip_serializing_if = "Option::is_none")]
++  pub to: Option<String>,
++  #[serde(default)]
++  pub current: Option<PartyQueueItem>,
++  pub items: Vec<PartyQueueItem>,
++  #[serde(default)]
++  pub history_tail: Vec<PlayedItem>,
++}
++
++#[derive(Clone, Debug)]
++pub struct PartyQueueError {
++  code: &'static str,
++  message: String,
++}
++
++impl PartyQueueError {
++  pub fn new(code: &'static str, message: impl Into<String>) -> Self {
++    Self {
++      code,
++      message: message.into(),
++    }
++  }
++
++  pub fn code(&self) -> &'static str {
++    self.code
++  }
++
++  pub fn message(&self) -> &str {
++    &self.message
++  }
++}
++
++/// The host-authoritative queue, and the guest-side mirror (same shape).
++#[derive(Clone, Debug, Serialize, Deserialize)]
++pub struct PartyQueue {
++  pub revision: u64,
++  pub next_id: u64,
++  pub current: Option<PartyQueueItem>,
++  pub items: Vec<PartyQueueItem>,
++  pub history: Vec<PlayedItem>,
++  pub config: PartyQueueConfig,
++  pub members: Vec<PartyMember>,
++  #[serde(skip)]
++  last_add_ms: HashMap<String, u64>,
++}
++
++impl Default for PartyQueue {
++  fn default() -> Self {
++    Self::new(PartyQueueConfig::default())
++  }
++}
++
++impl PartyQueue {
++  pub fn new(config: PartyQueueConfig) -> Self {
++    Self {
++      revision: 0,
++      next_id: 1,
++      current: None,
++      items: Vec::new(),
++      history: Vec::new(),
++      config,
++      members: Vec::new(),
++      last_add_ms: HashMap::new(),
++    }
++  }
++
++  pub fn with_host(config: PartyQueueConfig, host: PartyMember) -> Self {
++    let mut queue = Self::new(config);
++    queue.members = vec![host];
++    queue
++  }
++
++  /// Adopt the host's current playback and native queue when a jam starts.
++  pub fn adopt(
++    &mut self,
++    host: &PartyMember,
++    current: Option<&TrackInfo>,
++    queued: &[TrackInfo],
++    now_ms: u64,
++  ) {
++    self.current = current.and_then(|track| {
++      PartyTrack::from_track_info(track, false)
++        .ok()
++        .map(|t| PartyQueueItem::from_track(t, self.take_id(), host, now_ms))
++    });
++    for track in queued {
++      if let Ok(track) = PartyTrack::from_track_info(track, false) {
++        let item = PartyQueueItem::from_track(track, self.take_id(), host, now_ms);
++        self.items.push(item);
++      }
++    }
++    self.revision = if self.current.is_some() || !self.items.is_empty() {
++      1
++    } else {
++      0
++    };
++  }
++
++  pub fn len(&self) -> usize {
++    self.items.len() + usize::from(self.current.is_some())
++  }
++
++  pub fn projected_tracks(&self) -> Vec<TrackInfo> {
++    self
++      .items
++      .iter()
++      .map(PartyQueueItem::to_track_info)
++      .collect()
++  }
++
++  pub fn set_members(&mut self, members: Vec<PartyMember>) {
++    self.members = members;
++  }
++
++  fn take_id(&mut self) -> u64 {
++    let id = self.next_id;
++    self.next_id = self.next_id.saturating_add(1);
++    id
++  }
++
++  fn member(&self, id: &str) -> Option<&PartyMember> {
++    self.members.iter().find(|member| member.id == id)
++  }
++
++  fn push_history(&mut self, item: PartyQueueItem, now_ms: u64, skipped: bool) {
++    self.history.push(PlayedItem {
++      item,
++      played_at_ms: now_ms,
++      skipped,
++    });
++    if self.history.len() > HISTORY_LIMIT {
++      let excess = self.history.len() - HISTORY_LIMIT;
++      self.history.drain(..excess);
++    }
++  }
++
++  /// Validate and apply a participant intent. Returns the ops to broadcast.
++  pub fn apply_action(
++    &mut self,
++    action: QueueAction,
++    member: &PartyMember,
++    now_ms: u64,
++  ) -> Result<Vec<QueueOp>, PartyQueueError> {
++    let is_host = member.is_host() || self.member(&member.id).is_some_and(PartyMember::is_host);
++    match action {
++      QueueAction::Add {
++        uri,
++        title,
++        artists,
++        duration_ms,
++      } => {
++        if !is_host && self.config.queue_mode == PartyQueueMode::HostOnly {
++          return Err(PartyQueueError::new(
++            "forbidden",
++            "Solo el host puede añadir tracks",
++          ));
++        }
++        let track = PartyTrack::from_track_info(
++          &TrackInfo {
++            uri: Some(uri),
++            name: title,
++            artists,
++            album: String::new(),
++            duration_ms: duration_ms as u64,
++            id: None,
++            album_id: None,
++            artist_refs: Vec::new(),
++            is_playable: true,
++            is_local: false,
++            track_number: 0,
++            explicit: false,
++            image_url: None,
++            release_date: None,
++            generated_name: None,
++          },
++          true,
++        )?;
++        if self.len() >= self.config.max_items {
++          return Err(PartyQueueError::new("queue_full", "La cola está llena"));
++        }
++        if !is_host {
++          let own = self
++            .items
++            .iter()
++            .filter(|item| item.added_by == member.id)
++            .count();
++          if own >= self.config.max_per_guest {
++            return Err(PartyQueueError::new(
++              "guest_limit",
++              "Has alcanzado tu límite de tracks",
++            ));
++          }
++          if let Some(last) = self.last_add_ms.get(&member.id) {
++            if now_ms.saturating_sub(*last) < self.config.add_cooldown_ms {
++              return Err(PartyQueueError::new(
++                "rate_limited",
++                "Espera un momento antes de añadir otro track",
++              ));
++            }
++          }
++        }
++        if self.config.dedupe
++          && self
++            .current
++            .iter()
++            .chain(self.items.iter())
++            .any(|item| item.uri == track.uri)
++        {
++          return Err(PartyQueueError::new(
++            "duplicate",
++            "Ese track ya está en la cola",
++          ));
++        }
++        let id = self.take_id();
++        let item = PartyQueueItem::from_track(track, id, member, now_ms);
++        self.items.push(item.clone());
++        self.last_add_ms.insert(member.id.clone(), now_ms);
++        self.revision = self.revision.saturating_add(1);
++        Ok(vec![QueueOp::Add { item }])
++      }
++      QueueAction::Remove { id } => {
++        let Some(index) = self.items.iter().position(|item| item.id == id) else {
++          return Err(PartyQueueError::new(
++            "unknown_item",
++            "Ese track ya no está en la cola",
++          ));
++        };
++        let item = &self.items[index];
++        let owns = item.added_by == member.id;
++        let allowed = is_host || (self.config.queue_mode == PartyQueueMode::GuestsManage && owns);
++        if !allowed {
++          return Err(PartyQueueError::new(
++            "forbidden",
++            "No puedes quitar ese track",
++          ));
++        }
++        self.items.remove(index);
++        self.revision = self.revision.saturating_add(1);
++        Ok(vec![QueueOp::Remove { id }])
++      }
++      QueueAction::Move { id, after } => {
++        if !is_host && self.config.queue_mode != PartyQueueMode::GuestsManage {
++          return Err(PartyQueueError::new(
++            "forbidden",
++            "No puedes reordenar la cola",
++          ));
++        }
++        let Some(from) = self.items.iter().position(|item| item.id == id) else {
++          return Err(PartyQueueError::new(
++            "unknown_item",
++            "Ese track ya no está en la cola",
++          ));
++        };
++        if after == Some(id) {
++          return Err(PartyQueueError::new(
++            "stale_item",
++            "No puedes mover un track tras sí mismo",
++          ));
++        }
++        let target = match after {
++          Some(after) => {
++            let Some(pos) = self.items.iter().position(|item| item.id == after) else {
++              return Err(PartyQueueError::new(
++                "stale_item",
++                "El track de referencia ya no existe",
++              ));
++            };
++            if pos < from {
++              pos + 1
++            } else {
++              pos
++            }
++          }
++          None => 0,
++        };
++        let item = self.items.remove(from);
++        let target = target.min(self.items.len());
++        self.items.insert(target, item);
++        self.revision = self.revision.saturating_add(1);
++        Ok(vec![QueueOp::Move { id, after }])
++      }
++      QueueAction::Clear => {
++        if !is_host {
++          return Err(PartyQueueError::new(
++            "forbidden",
++            "Solo el host puede vaciar la cola",
++          ));
++        }
++        self.items.clear();
++        self.revision = self.revision.saturating_add(1);
++        Ok(vec![QueueOp::Clear])
++      }
++      QueueAction::PlayNow { id } => {
++        if !is_host {
++          return Err(PartyQueueError::new(
++            "forbidden",
++            "Solo el host puede poner un track ahora",
++          ));
++        }
++        let Some(index) = self.items.iter().position(|item| item.id == id) else {
++          return Err(PartyQueueError::new(
++            "unknown_item",
++            "Ese track ya no está en la cola",
++          ));
++        };
++        let item = self.items.remove(index);
++        let played_id = self.current.as_ref().map(|current| current.id);
++        if let Some(current) = self.current.take() {
++          self.push_history(current, now_ms, true);
++        }
++        self.current = Some(item.clone());
++        self.revision = self.revision.saturating_add(1);
++        Ok(vec![QueueOp::SetCurrent {
++          current: item,
++          played_id,
++          skipped: true,
++        }])
++      }
++      QueueAction::Vote { .. } => Err(PartyQueueError::new(
++        "unsupported",
++        "La votación todavía no está disponible",
++      )),
++    }
++  }
++
++  /// Guest-side replay. Returns `StaleRev` when a patch is missing.
++  pub fn apply_patch(&mut self, patch: &QueuePatch) -> Result<(), PartyQueueError> {
++    if patch.revision != self.revision.saturating_add(1) {
++      return Err(PartyQueueError::new(
++        "stale_rev",
++        "La revisión no es contigua; pide un snapshot",
++      ));
++    }
++    for op in &patch.ops {
++      match op {
++        QueueOp::Add { item } => {
++          if item.id != 0 && self.items.iter().all(|existing| existing.id != item.id) {
++            self.items.push(item.clone());
++          }
++        }
++        QueueOp::Remove { id } => {
++          self.items.retain(|item| item.id != *id);
++        }
++        QueueOp::Move { id, after } => {
++          if let Some(from) = self.items.iter().position(|item| item.id == *id) {
++            let item = self.items.remove(from);
++            let target = match after {
++              Some(after) => self
++                .items
++                .iter()
++                .position(|item| item.id == *after)
++                .map(|pos| pos + 1)
++                .unwrap_or(self.items.len()),
++              None => 0,
++            };
++            self.items.insert(target.min(self.items.len()), item);
++          }
++        }
++        QueueOp::Clear => self.items.clear(),
++        QueueOp::Advance {
++          current,
++          played_id,
++          skipped,
++        } => {
++          if let Some(old) = self.current.take() {
++            self.push_history(old, current.added_at_ms, *skipped);
++          }
++          self
++            .items
++            .retain(|item| item.id != *played_id && item.id != current.id);
++          self.current = Some(current.clone());
++        }
++        QueueOp::SetCurrent {
++          current,
++          played_id,
++          skipped,
++        } => {
++          if let Some(old) = self.current.take() {
++            self.push_history(old, current.added_at_ms, *skipped);
++          }
++          if let Some(played_id) = played_id {
++            self.items.retain(|item| item.id != *played_id);
++          }
++          self.items.retain(|item| item.id != current.id);
++          self.current = Some(current.clone());
++        }
++        QueueOp::ClearCurrent => {
++          if let Some(old) = self.current.take() {
++            self.push_history(old, 0, true);
++          }
++        }
++        QueueOp::Reset { current, items } => {
++          self.current = current.clone();
++          self.items = items.clone();
++        }
++      }
++    }
++    self.revision = patch.revision;
++    Ok(())
++  }
++
++  /// Replace the mirror with an assembled snapshot.
++  pub fn apply_snapshot(&mut self, snapshot: &PartyQueueSnapshot) {
++    if snapshot.revision < self.revision {
++      return;
++    }
++    self.revision = snapshot.revision;
++    self.current = snapshot.current.clone();
++    self.items = snapshot.items.clone();
++    if !snapshot.history_tail.is_empty() {
++      self.history = snapshot.history_tail.clone();
++    }
++  }
++
++  /// Detect a playback transition and return the op that records it.
++  ///
++  /// `uri` is the track the host is actually playing. When it matches the head
++  /// of the queue, the current item moves to history and the head becomes
++  /// current. A track outside the queue clears `current` (the host is playing
++  /// a context, not the jam queue) but leaves the queued items intact.
++  pub fn observe_playback(&mut self, uri: &str, now_ms: u64) -> Option<QueueOp> {
++    if self.current.as_ref().is_some_and(|item| item.uri == uri) {
++      return None;
++    }
++    if let Some(index) = self.items.iter().position(|item| item.uri == uri) {
++      let item = self.items.remove(index);
++      let played_id = self.current.as_ref().map(|current| current.id);
++      if let Some(current) = self.current.take() {
++        self.push_history(current, now_ms, false);
++      }
++      self.current = Some(item.clone());
++      self.revision = self.revision.saturating_add(1);
++      return Some(QueueOp::Advance {
++        current: item,
++        played_id: played_id.unwrap_or(0),
++        skipped: false,
++      });
++    }
++    if self.current.is_some() {
++      self.current = None;
++      self.revision = self.revision.saturating_add(1);
++      return Some(QueueOp::ClearCurrent);
++    }
++    None
++  }
++
++  pub fn snapshot(&self, snapshot_id: &str, to: Option<String>) -> PartyQueueSnapshot {
++    PartyQueueSnapshot {
++      revision: self.revision,
++      snapshot_id: snapshot_id.to_string(),
++      chunk: 0,
++      chunks: 1,
++      to,
++      current: self.current.clone(),
++      items: self.items.clone(),
++      history_tail: self
++        .history
++        .iter()
++        .rev()
++        .take(20)
++        .cloned()
++        .collect::<Vec<_>>()
++        .into_iter()
++        .rev()
++        .collect(),
++    }
++  }
++}
++
++/// Collects chunked snapshots and returns the full one when complete.
++#[derive(Default)]
++pub struct SnapshotAssembler {
++  snapshot_id: Option<String>,
++  revision: u64,
++  chunks: u16,
++  current: Option<PartyQueueItem>,
++  items: Vec<Option<Vec<PartyQueueItem>>>,
++  history_tail: Vec<PlayedItem>,
++}
++
++impl SnapshotAssembler {
++  pub fn push(&mut self, snapshot: &PartyQueueSnapshot) -> Option<PartyQueueSnapshot> {
++    if snapshot.chunks == 0 || snapshot.chunk >= snapshot.chunks || snapshot.chunks > 50 {
++      return None;
++    }
++    if self.snapshot_id.as_deref() != Some(snapshot.snapshot_id.as_str())
++      || self.revision != snapshot.revision
++    {
++      self.snapshot_id = Some(snapshot.snapshot_id.clone());
++      self.revision = snapshot.revision;
++      self.chunks = snapshot.chunks;
++      self.current = snapshot.current.clone();
++      self.items = vec![None; snapshot.chunks as usize];
++      self.history_tail = snapshot.history_tail.clone();
++    }
++    let index = snapshot.chunk as usize;
++    self.items[index] = Some(snapshot.items.clone());
++    if self.items.iter().all(Option::is_some) {
++      let items = self
++        .items
++        .iter()
++        .flat_map(|chunk| chunk.clone().unwrap_or_default())
++        .collect();
++      Some(PartyQueueSnapshot {
++        revision: snapshot.revision,
++        snapshot_id: snapshot.snapshot_id.clone(),
++        chunk: 0,
++        chunks: 1,
++        to: snapshot.to.clone(),
++        current: self.current.clone(),
++        items,
++        history_tail: self.history_tail.clone(),
++      })
++    } else {
++      None
++    }
++  }
++}
++
++pub fn is_spotify_track_uri(uri: &str) -> bool {
++  uri
++    .strip_prefix("spotify:track:")
++    .is_some_and(|id| id.len() == 22 && id.chars().all(|c| c.is_ascii_alphanumeric()))
++}
++
++fn sanitize(value: &str, max: usize) -> String {
++  let cleaned: String = value
++    .chars()
++    .filter(|c| !c.is_control())
++    .collect::<String>()
++    .trim()
++    .to_string();
++  if cleaned.chars().count() <= max {
++    cleaned
++  } else {
++    cleaned.chars().take(max).collect()
++  }
++}
++
++#[cfg(test)]
++mod tests {
++  use super::*;
++
++  const NOW: u64 = 1_762_891_200_000;
++
++  fn host() -> PartyMember {
++    PartyMember::host("manu")
++  }
++
++  fn guest(id: &str) -> PartyMember {
++    PartyMember::guest(id, "ana")
++  }
++
++  fn track(id: char, title: &str) -> TrackInfo {
++    let base = "7o2AeQZzfCERsRmOM86EcB";
++    let mut uri: Vec<char> = base.chars().collect();
++    uri[0] = id;
++    let uri = format!("spotify:track:{}", uri.into_iter().collect::<String>());
++    TrackInfo {
++      uri: Some(uri),
++      name: title.to_string(),
++      artists: vec!["Burial".to_string()],
++      album: String::new(),
++      duration_ms: 299_000,
++      id: None,
++      album_id: None,
++      artist_refs: Vec::new(),
++      is_playable: true,
++      is_local: false,
++      track_number: 0,
++      explicit: false,
++      image_url: None,
++      release_date: None,
++      generated_name: None,
++    }
++  }
++
++  fn add(uri: &str, title: &str) -> QueueAction {
++    QueueAction::Add {
++      uri: uri.to_string(),
++      title: title.to_string(),
++      artists: vec!["Burial".to_string()],
++      duration_ms: 299_000,
++    }
++  }
++
++  #[test]
++  fn host_adds_a_track() {
++    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
++    let ops = queue
++      .apply_action(
++        add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "Archangel"),
++        &host(),
++        NOW,
++      )
++      .unwrap();
++    assert_eq!(queue.items.len(), 1);
++    assert_eq!(queue.revision, 1);
++    assert!(matches!(ops[0], QueueOp::Add { .. }));
++  }
++
++  #[test]
++  fn guest_add_is_rejected_in_host_only() {
++    let mut queue = PartyQueue::with_host(
++      PartyQueueConfig {
++        queue_mode: PartyQueueMode::HostOnly,
++        ..Default::default()
++      },
++      host(),
++    );
++    queue.set_members(vec![host(), guest("p-1")]);
++    let err = queue
++      .apply_action(
++        add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "Archangel"),
++        &guest("p-1"),
++        NOW,
++      )
++      .unwrap_err();
++    assert_eq!(err.code(), "forbidden");
++  }
++
++  #[test]
++  fn guest_add_is_allowed_in_guests_add() {
++    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
++    queue.set_members(vec![host(), guest("p-1")]);
++    queue
++      .apply_action(
++        add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "Archangel"),
++        &guest("p-1"),
++        NOW,
++      )
++      .unwrap();
++    assert_eq!(queue.items.len(), 1);
++    assert_eq!(queue.items[0].added_by, "p-1");
++  }
++
++  #[test]
++  fn rejects_bad_uri_and_missing_metadata() {
++    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
++    assert_eq!(
++      queue
++        .apply_action(add("spotify:album:abc", "x"), &host(), NOW)
++        .unwrap_err()
++        .code(),
++      "invalid_uri"
++    );
++    assert_eq!(
++      queue
++        .apply_action(
++          QueueAction::Add {
++            uri: "spotify:track:7o2AeQZzfCERsRmOM86EcB".to_string(),
++            title: String::new(),
++            artists: vec!["Burial".to_string()],
++            duration_ms: 1000,
++          },
++          &host(),
++          NOW
++        )
++        .unwrap_err()
++        .code(),
++      "invalid_metadata"
++    );
++  }
++
++  #[test]
++  fn dedupes_by_uri() {
++    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
++    let action = add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "Archangel");
++    queue.apply_action(action.clone(), &host(), NOW).unwrap();
++    assert_eq!(
++      queue
++        .apply_action(action, &host(), NOW + 3_000)
++        .unwrap_err()
++        .code(),
++      "duplicate"
++    );
++  }
++
++  #[test]
++  fn enforces_queue_and_guest_limits() {
++    let mut queue = PartyQueue::with_host(
++      PartyQueueConfig {
++        max_items: 2,
++        max_per_guest: 1,
++        add_cooldown_ms: 0,
++        ..Default::default()
++      },
++      host(),
++    );
++    queue.set_members(vec![host(), guest("p-1")]);
++    queue
++      .apply_action(
++        add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "A"),
++        &guest("p-1"),
++        NOW,
++      )
++      .unwrap();
++    assert_eq!(
++      queue
++        .apply_action(
++          add("spotify:track:7o2AeQZzfCERsRmOM86EcX", "B"),
++          &guest("p-1"),
++          NOW
++        )
++        .unwrap_err()
++        .code(),
++      "guest_limit"
++    );
++    queue.set_members(vec![host(), guest("p-2")]);
++    queue
++      .apply_action(
++        add("spotify:track:7o2AeQZzfCERsRmOM86EcX", "B"),
++        &guest("p-2"),
++        NOW,
++      )
++      .unwrap();
++    assert_eq!(
++      queue
++        .apply_action(
++          add("spotify:track:7o2AeQZzfCERsRmOM86EcY", "C"),
++          &host(),
++          NOW
++        )
++        .unwrap_err()
++        .code(),
++      "queue_full"
++    );
++  }
++
++  #[test]
++  fn enforces_add_cooldown() {
++    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
++    queue.set_members(vec![host(), guest("p-1")]);
++    queue
++      .apply_action(
++        add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "A"),
++        &guest("p-1"),
++        NOW,
++      )
++      .unwrap();
++    assert_eq!(
++      queue
++        .apply_action(
++          add("spotify:track:7o2AeQZzfCERsRmOM86EcX", "B"),
++          &guest("p-1"),
++          NOW + 1
++        )
++        .unwrap_err()
++        .code(),
++      "rate_limited"
++    );
++  }
++
++  #[test]
++  fn move_uses_after_and_keeps_ids_stable() {
++    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
++    for (i, c) in ["A", "B", "C"].iter().enumerate() {
++      let uri = format!("spotify:track:7o2AeQZzfCERsRmOM86Ec{}", c);
++      queue
++        .apply_action(add(&uri, c), &host(), NOW + i as u64 * 3_000)
++        .unwrap();
++    }
++    let ids: Vec<u64> = queue.items.iter().map(|i| i.id).collect();
++    queue
++      .apply_action(
++        QueueAction::Move {
++          id: ids[2],
++          after: None,
++        },
++        &host(),
++        NOW,
++      )
++      .unwrap();
++    assert_eq!(queue.items[0].id, ids[2]);
++    assert_eq!(queue.items[1].id, ids[0]);
++  }
++
++  #[test]
++  fn move_rejects_a_missing_anchor() {
++    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
++    queue
++      .apply_action(
++        add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "A"),
++        &host(),
++        NOW,
++      )
++      .unwrap();
++    let id = queue.items[0].id;
++    assert_eq!(
++      queue
++        .apply_action(
++          QueueAction::Move {
++            id,
++            after: Some(999)
++          },
++          &host(),
++          NOW
++        )
++        .unwrap_err()
++        .code(),
++      "stale_item"
++    );
++  }
++
++  #[test]
++  fn play_now_moves_the_previous_current_to_history() {
++    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
++    queue
++      .apply_action(
++        add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "A"),
++        &host(),
++        NOW,
++      )
++      .unwrap();
++    queue
++      .apply_action(
++        add("spotify:track:7o2AeQZzfCERsRmOM86EcX", "B"),
++        &host(),
++        NOW,
++      )
++      .unwrap();
++    let second = queue.items[1].id;
++    let ops = queue
++      .apply_action(QueueAction::PlayNow { id: second }, &host(), NOW)
++      .unwrap();
++    assert!(matches!(ops[0], QueueOp::SetCurrent { .. }));
++    assert_eq!(queue.current.as_ref().unwrap().id, second);
++    assert_eq!(queue.items.len(), 1);
++  }
++
++  #[test]
++  fn patch_rejects_a_gap_and_accepts_the_next_revision() {
++    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
++    let mut patch = QueuePatch {
++      revision: 2,
++      ops: vec![],
++    };
++    assert_eq!(queue.apply_patch(&patch).unwrap_err().code(), "stale_rev");
++    patch.revision = 1;
++    queue.apply_patch(&patch).unwrap();
++    assert_eq!(queue.revision, 1);
++  }
++
++  #[test]
++  fn patch_can_add_and_move() {
++    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
++    let mut first = PartyQueueItem::from_track(
++      PartyTrack::from_track_info(&track('7', "A"), true).unwrap(),
++      1,
++      &host(),
++      NOW,
++    );
++    first.id = 1;
++    let mut second = first.clone();
++    second.id = 2;
++    second.uri = "spotify:track:7o2AeQZzfCERsRmOM86EcX".to_string();
++    queue
++      .apply_patch(&QueuePatch {
++        revision: 1,
++        ops: vec![
++          QueueOp::Add {
++            item: first.clone(),
++          },
++          QueueOp::Add {
++            item: second.clone(),
++          },
++          QueueOp::Move { id: 2, after: None },
++        ],
++      })
++      .unwrap();
++    assert_eq!(queue.items[0].id, 2);
++  }
++
++  #[test]
++  fn snapshot_assembler_waits_for_every_chunk() {
++    let item = PartyQueueItem::from_track(
++      PartyTrack::from_track_info(&track('7', "A"), true).unwrap(),
++      1,
++      &host(),
++      NOW,
++    );
++    let mut assembler = SnapshotAssembler::default();
++    assert!(assembler
++      .push(&PartyQueueSnapshot {
++        revision: 3,
++        snapshot_id: "s".into(),
++        chunk: 0,
++        chunks: 2,
++        to: None,
++        current: None,
++        items: vec![item.clone()],
++        history_tail: vec![],
++      })
++      .is_none());
++    let full = assembler
++      .push(&PartyQueueSnapshot {
++        revision: 3,
++        snapshot_id: "s".into(),
++        chunk: 1,
++        chunks: 2,
++        to: None,
++        current: None,
++        items: vec![item],
++        history_tail: vec![],
++      })
++      .unwrap();
++    assert_eq!(full.items.len(), 2);
++  }
++
++  #[test]
++  fn observe_playback_advances_the_head() {
++    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
++    queue
++      .apply_action(
++        add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "A"),
++        &host(),
++        NOW,
++      )
++      .unwrap();
++    let uri = queue.items[0].uri.clone();
++    let op = queue.observe_playback(&uri, NOW).unwrap();
++    assert!(matches!(op, QueueOp::Advance { .. }));
++    assert_eq!(queue.current.as_ref().unwrap().uri, uri);
++    assert!(queue.items.is_empty());
++  }
++
++  #[test]
++  fn observe_playback_clears_current_for_a_context_track() {
++    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
++    queue
++      .apply_action(
++        add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "A"),
++        &host(),
++        NOW,
++      )
++      .unwrap();
++    let uri = queue.items[0].uri.clone();
++    queue.observe_playback(&uri, NOW);
++    let other = "spotify:track:7o2AeQZzfCERsRmOM86EcZ";
++    assert!(matches!(
++      queue.observe_playback(other, NOW),
++      Some(QueueOp::ClearCurrent)
++    ));
++    assert!(queue.current.is_none());
++  }
++
++  #[test]
++  fn random_patch_sequences_converge() {
++    // A tiny deterministic LCG keeps this test dependency-free while still
++    // exercising arbitrary add/remove/move/replay sequences.
++    let mut state = 0x1234_5678_9abc_def0u64;
++    let mut next = || {
++      state = state
++        .wrapping_mul(6364136223846793005)
++        .wrapping_add(1442695040888963407);
++      state
++    };
++    let mut host_queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
++    let mut mirror = PartyQueue::with_host(PartyQueueConfig::default(), host());
++    for i in 0..200 {
++      let id = next() % 1_000_000;
++      let uri = format!("spotify:track:{:022}", id % 1_000_000_000_000);
++      let ops = match next() % 4 {
++        0 => host_queue.apply_action(add(&uri, &format!("T{i}")), &host(), NOW + i),
++        1 => host_queue.apply_action(
++          QueueAction::Remove {
++            id: host_queue.items.first().map(|item| item.id).unwrap_or(0),
++          },
++          &host(),
++          NOW + i,
++        ),
++        2 => host_queue.apply_action(
++          QueueAction::Move {
++            id: host_queue.items.first().map(|item| item.id).unwrap_or(0),
++            after: None,
++          },
++          &host(),
++          NOW + i,
++        ),
++        _ => Ok(vec![]),
++      };
++      if let Ok(ops) = ops {
++        if !ops.is_empty() {
++          mirror
++            .apply_patch(&QueuePatch {
++              revision: host_queue.revision,
++              ops,
++            })
++            .unwrap();
++        }
++      }
++    }
++    assert_eq!(mirror.items, host_queue.items);
++    assert_eq!(mirror.revision, host_queue.revision);
++  }
++}
+diff --git a/src/gui/protocol.rs b/src/gui/protocol.rs
+index b5606c0..346043f 100644
+--- a/src/gui/protocol.rs
++++ b/src/gui/protocol.rs
+@@ -2457,9 +2457,14 @@ mod tests {
+       role: PartyRole::Host,
+       code: "ABC123".to_string(),
+       guests: vec!["Sam".to_string()],
++      members: Vec::new(),
++      participant_id: "host".to_string(),
++      self_name: "Host".to_string(),
+       control_mode: ControlMode::HostOnly,
+       host_name: "Host".to_string(),
+       host_state_at: None,
++      queue_revision: 0,
++      queue_enabled: true,
+     }));
+ 
+     let party = &pushed(&diff(&before, &app, Language::En), "party")["payload"];
+diff --git a/src/infra/network/library.rs b/src/infra/network/library.rs
+index eed62d3..c92594c 100644
+--- a/src/infra/network/library.rs
++++ b/src/infra/network/library.rs
+@@ -3223,8 +3223,8 @@ async fn resolve_rootlist_only_playlists(
+ ) -> Vec<PlaylistInfo> {
+   use protobuf::Message;
+ 
+-  let lookups = ids.iter().cloned().map(|id| async move {
+-    let spotify_id = librespot_core::SpotifyId::from_base62(&id).ok()?;
++  let lookups = ids.iter().map(|id| async move {
++    let spotify_id = librespot_core::SpotifyId::from_base62(id).ok()?;
+     let bytes = match session.spclient().get_playlist(&spotify_id).await {
+       Ok(bytes) => bytes,
+       Err(error) => {
+@@ -3240,7 +3240,7 @@ async fn resolve_rootlist_only_playlists(
+       return None;
+     }
+     Some(rootlist_playlist_info(
+-      &id,
++      id,
+       name,
+       selected.owner_username(),
+       selected.length().max(0) as u32,
+diff --git a/src/infra/network/mod.rs b/src/infra/network/mod.rs
+index ce29d65..b20a35b 100644
+--- a/src/infra/network/mod.rs
++++ b/src/infra/network/mod.rs
+@@ -18,6 +18,7 @@ pub mod utils;
+ use crate::core::app::SPOTIFY_NOT_CONNECTED_STATUS;
+ use crate::core::app::{App, PlaybackOwner};
+ use crate::core::auth::SpotifyLogin;
++use crate::core::party::{PartyMember, QueueAck, QueueAction, QueueCommand, QueuePatch};
+ use crate::core::plugin_api::{ShowInfo, TrackInfo};
+ use crate::core::source::Source;
+ use anyhow::anyhow;
+@@ -202,6 +203,8 @@ pub enum IoEvent {
+   /// Send a playback command to the party host (guest only, Phase 2)
+   #[allow(dead_code)]
+   PartyPlaybackCommand(sync::PlaybackAction),
++  /// Apply a queue intent locally (host) or send it to the host (guest).
++  PartyQueueCommand(crate::core::party::QueueAction),
+   /// Search tracks to add to a new playlist
+   SearchTracksForPlaylist(String),
+   /// Create a new playlist: playlist name, track ids/URIs.
+@@ -431,6 +434,9 @@ pub struct Network {
+   native_idle_recovery: playback::NativeIdleRecoveryState,
+   pub party_connection: Option<sync::PartyConnection>,
+   pub party_incoming_rx: Option<tokio::sync::mpsc::UnboundedReceiver<sync::SyncMessage>>,
++  party_snapshot_assembler: crate::core::party::SnapshotAssembler,
++  /// Recent queue intent ids, so a retry after a reconnect cannot duplicate.
++  party_seen_ops: std::collections::HashSet<String>,
+   /// The pairing prompt of an in-app login that waits for the approval in the browser.
+   login_prompt: Option<SpotifyPairingPrompt>,
+   /// How many playback polls in a row came back 401. A lone 401 is noise; only
+@@ -501,6 +507,8 @@ impl Network {
+       native_idle_recovery: playback::NativeIdleRecoveryState::default(),
+       party_connection: None,
+       party_incoming_rx: None,
++      party_snapshot_assembler: Default::default(),
++      party_seen_ops: Default::default(),
+       login_prompt: None,
+       consecutive_playback_auth_failures: 0,
+       artist_cache: Default::default(),
+@@ -578,6 +586,7 @@ impl Network {
+         | IoEvent::LeaveParty
+         | IoEvent::SyncPlayback
+         | IoEvent::PartyPlaybackCommand(_)
++        | IoEvent::PartyQueueCommand(_)
+         | IoEvent::GetLocalPlaylists
+         | IoEvent::GetLocalTracks(_)
+         | IoEvent::GetSubsonicPlaylists
+@@ -1091,6 +1100,9 @@ impl Network {
+       IoEvent::PartyPlaybackCommand(action) => {
+         self.party_playback_command(action).await;
+       }
++      IoEvent::PartyQueueCommand(action) => {
++        self.party_queue_command(action).await;
++      }
+       IoEvent::SearchTracksForPlaylist(query) => {
+         self.search_tracks_for_playlist(query).await;
+       }
+@@ -1544,6 +1556,7 @@ impl Network {
+     {
+       let mut app = self.app.lock().await;
+       app.set_party_status(sync::PartyStatus::Connecting);
++      app.reset_party_queue();
+     }
+ 
+     let relay_url = {
+@@ -1556,7 +1569,18 @@ impl Network {
+       sync::ControlMode::SharedControl => "shared_control",
+     };
+ 
+-    match sync::connect_to_relay(&relay_url, "create", &[("control_mode", mode_str)]).await {
++    match sync::connect_to_relay(
++      &relay_url,
++      "create",
++      &[
++        ("control_mode", mode_str),
++        ("v", "2"),
++        ("features", "queue"),
++        ("name", "Host"),
++      ],
++    )
++    .await
++    {
+       Ok((conn, read)) => {
+         let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
+         tokio::spawn(sync::start_party_reader(read, incoming_tx));
+@@ -1569,9 +1593,14 @@ impl Network {
+           role: sync::PartyRole::Host,
+           code: String::new(),
+           guests: Vec::new(),
++          members: vec![crate::core::party::PartyMember::host("Host")],
++          participant_id: "host".to_string(),
++          self_name: "Host".to_string(),
+           control_mode,
+           host_name: "Host".to_string(),
+           host_state_at: None,
++          queue_revision: 0,
++          queue_enabled: true,
+         }));
+       }
+       Err(e) => {
+@@ -1608,6 +1637,7 @@ impl Network {
+     {
+       let mut app = self.app.lock().await;
+       app.set_party_status(sync::PartyStatus::Connecting);
++      app.reset_party_queue();
+     }
+ 
+     let relay_url = {
+@@ -1615,7 +1645,18 @@ impl Network {
+       app.user_config.behavior.relay_server_url.clone()
+     };
+ 
+-    match sync::connect_to_relay(&relay_url, "join", &[("code", &code), ("name", &name)]).await {
++    match sync::connect_to_relay(
++      &relay_url,
++      "join",
++      &[
++        ("code", &code),
++        ("name", &name),
++        ("v", "2"),
++        ("features", "queue"),
++      ],
++    )
++    .await
++    {
+       Ok((conn, read)) => {
+         let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
+         tokio::spawn(sync::start_party_reader(read, incoming_tx));
+@@ -1628,9 +1669,14 @@ impl Network {
+           role: sync::PartyRole::Guest,
+           code: code.to_uppercase(),
+           guests: Vec::new(),
++          members: Vec::new(),
++          participant_id: String::new(),
++          self_name: name.clone(),
+           control_mode: sync::ControlMode::default(),
+           host_name: String::new(),
+           host_state_at: None,
++          queue_revision: 0,
++          queue_enabled: true,
+         }));
+       }
+       Err(e) => {
+@@ -1653,13 +1699,32 @@ impl Network {
+     }
+     self.party_connection = None;
+     self.party_incoming_rx = None;
++    self.party_snapshot_assembler = Default::default();
++    self.party_seen_ops.clear();
+ 
+     let mut app = self.app.lock().await;
+     app.set_party_status(sync::PartyStatus::Disconnected);
+     app.set_party_session(None);
++    app.reset_party_queue();
+   }
+ 
+   async fn sync_playback(&mut self) {
++    let queue_patch = {
++      let mut app = self.app.lock().await;
++      if app.party_is_host() {
++        app.observe_party_playback().map(|op| QueuePatch {
++          revision: app.party_queue().revision,
++          ops: vec![op],
++        })
++      } else {
++        None
++      }
++    };
++    if let Some(patch) = queue_patch {
++      self
++        .send_party_message(&sync::SyncMessage::QueuePatch(patch))
++        .await;
++    }
+     let sync_state = {
+       let app = self.app.lock().await;
+       let session = match app.party_session() {
+@@ -1714,14 +1779,271 @@ impl Network {
+   }
+ 
+   async fn party_playback_command(&mut self, action: sync::PlaybackAction) {
+-    let msg = sync::SyncMessage::PlaybackCommand { action, from: None };
++    let msg = sync::SyncMessage::PlaybackCommand {
++      action,
++      from: None,
++      from_id: None,
++    };
++    self.send_party_message(&msg).await;
++  }
++
++  async fn send_party_message(&mut self, msg: &sync::SyncMessage) {
+     if let Some(conn) = &mut self.party_connection {
+-      if let Err(e) = conn.send(&msg).await {
+-        log::error!("Failed to send playback command: {}", e);
++      if let Err(e) = conn.send(msg).await {
++        log::error!("Failed to send party message: {}", e);
+       }
+     }
+   }
+ 
++  /// Apply a host intent and broadcast the resulting patch, or forward a
++  /// guest intent to the host through the relay.
++  async fn party_queue_command(&mut self, action: QueueAction) {
++    let is_host = {
++      let app = self.app.lock().await;
++      app.party_is_host() && app.party_is_active()
++    };
++    if is_host {
++      let (advance_patch, patch, error, play_now_uri) = {
++        let mut app = self.app.lock().await;
++        let Some(session) = app.party_session() else {
++          return;
++        };
++        if !session.supports_queue() {
++          return;
++        }
++        let member = PartyMember::host(session.self_name.clone());
++        // Materialize a natural advance before mutating the queue, otherwise
++        // projection would put the already-playing head back into native_queue.
++        let advance = app.observe_party_playback().map(|op| QueuePatch {
++          revision: app.party_queue().revision,
++          ops: vec![op],
++        });
++        let play_now = matches!(action, QueueAction::PlayNow { .. });
++        match app
++          .party_queue_mut()
++          .apply_action(action, &member, sync::now_ms())
++        {
++          Ok(ops) => {
++            app.project_party_queue();
++            let uri = if play_now {
++              app
++                .party_queue()
++                .current
++                .as_ref()
++                .map(|item| item.uri.clone())
++            } else {
++              None
++            };
++            (
++              advance,
++              Some(QueuePatch {
++                revision: app.party_queue().revision,
++                ops,
++              }),
++              None,
++              uri,
++            )
++          }
++          Err(error) => (advance, None, Some(error), None),
++        }
++      };
++      if let Some(error) = error {
++        let mut app = self.app.lock().await;
++        app.set_status_message(error.message(), 4);
++      }
++      if let Some(patch) = advance_patch {
++        self
++          .send_party_message(&sync::SyncMessage::QueuePatch(patch))
++          .await;
++      }
++      if let Some(patch) = patch {
++        self
++          .send_party_message(&sync::SyncMessage::QueuePatch(patch))
++          .await;
++      }
++      if let Some(uri) = play_now_uri {
++        let mut app = self.app.lock().await;
++        app.start_playback_uris(vec![uri], None);
++      }
++      return;
++    }
++
++    let base_rev = {
++      let app = self.app.lock().await;
++      app.party_queue().revision
++    };
++    let command = QueueCommand {
++      op_id: next_party_op_id(),
++      from: None,
++      from_id: None,
++      base_rev,
++      action,
++    };
++    self
++      .send_party_message(&sync::SyncMessage::QueueCommand(command))
++      .await;
++  }
++
++  async fn send_party_snapshot(&mut self, to: Option<String>) {
++    let snapshot = {
++      let mut app = self.app.lock().await;
++      if !app.party_is_active() {
++        return;
++      }
++      app.observe_party_playback();
++      let revision = app.party_queue().revision;
++      app
++        .party_queue()
++        .snapshot(&format!("r{}-{}", revision, sync::now_ms()), to)
++    };
++    for message in sync::queue_snapshot_messages(&snapshot) {
++      self.send_party_message(&message).await;
++    }
++  }
++
++  async fn send_party_config(&mut self) {
++    let (config, members) = {
++      let app = self.app.lock().await;
++      let members = app
++        .party_session()
++        .map(|session| session.members.clone())
++        .unwrap_or_default();
++      (app.party_queue().config.clone(), members)
++    };
++    self
++      .send_party_message(&sync::SyncMessage::PartyConfig { config })
++      .await;
++    self
++      .send_party_message(&sync::SyncMessage::PartyMembers { members })
++      .await;
++  }
++
++  async fn handle_party_queue_command(&mut self, command: QueueCommand) {
++    let is_host = {
++      let app = self.app.lock().await;
++      app.party_is_host()
++    };
++    if !is_host {
++      return;
++    }
++    let member = {
++      let app = self.app.lock().await;
++      let id = command
++        .from_id
++        .clone()
++        .or_else(|| command.from.clone())
++        .unwrap_or_else(|| "guest".to_string());
++      let name = command
++        .from
++        .clone()
++        .filter(|name| name != &id)
++        .unwrap_or_else(|| "Guest".to_string());
++      app
++        .party_session()
++        .and_then(|session| {
++          session
++            .members
++            .iter()
++            .find(|member| member.id == id)
++            .cloned()
++        })
++        .unwrap_or_else(|| PartyMember::guest(id, name))
++    };
++    let target = command.from_id.clone().or_else(|| command.from.clone());
++    let op_key = format!("{}:{}", target.as_deref().unwrap_or("guest"), command.op_id);
++    if !command.op_id.is_empty() && !self.party_seen_ops.insert(op_key) {
++      let revision = {
++        let app = self.app.lock().await;
++        app.party_queue().revision
++      };
++      self
++        .send_party_message(&sync::SyncMessage::QueueAck(QueueAck {
++          op_id: command.op_id,
++          ok: true,
++          error: None,
++          message: None,
++          revision,
++          to: target,
++        }))
++        .await;
++      return;
++    }
++    if self.party_seen_ops.len() > 512 {
++      self.party_seen_ops.clear();
++    }
++    let (ack, advance_patch, patch, play_now_uri) = {
++      let mut app = self.app.lock().await;
++      let advance = app.observe_party_playback().map(|op| QueuePatch {
++        revision: app.party_queue().revision,
++        ops: vec![op],
++      });
++      let play_now = matches!(command.action, QueueAction::PlayNow { .. });
++      match app
++        .party_queue_mut()
++        .apply_action(command.action, &member, sync::now_ms())
++      {
++        Ok(ops) => {
++          app.project_party_queue();
++          let uri = if play_now {
++            app
++              .party_queue()
++              .current
++              .as_ref()
++              .map(|item| item.uri.clone())
++          } else {
++            None
++          };
++          (
++            QueueAck {
++              op_id: command.op_id.clone(),
++              ok: true,
++              error: None,
++              message: None,
++              revision: app.party_queue().revision,
++              to: target.clone(),
++            },
++            advance,
++            Some(QueuePatch {
++              revision: app.party_queue().revision,
++              ops,
++            }),
++            uri,
++          )
++        }
++        Err(error) => (
++          QueueAck {
++            op_id: command.op_id.clone(),
++            ok: false,
++            error: Some(error.code().to_string()),
++            message: Some(error.message().to_string()),
++            revision: app.party_queue().revision,
++            to: target.clone(),
++          },
++          advance,
++          None,
++          None,
++        ),
++      }
++    };
++    if let Some(patch) = advance_patch {
++      self
++        .send_party_message(&sync::SyncMessage::QueuePatch(patch))
++        .await;
++    }
++    self
++      .send_party_message(&sync::SyncMessage::QueueAck(ack))
++      .await;
++    if let Some(patch) = patch {
++      self
++        .send_party_message(&sync::SyncMessage::QueuePatch(patch))
++        .await;
++    }
++    if let Some(uri) = play_now_uri {
++      let mut app = self.app.lock().await;
++      app.start_playback_uris(vec![uri], None);
++    }
++  }
++
+   pub async fn process_party_messages(&mut self) {
+     // Every relay handler below drives the Spotify client; without a session
+     // there is nothing to sync and `spotify()` would panic the pump. Close the
+@@ -1761,43 +2083,158 @@ impl Network {
+     let mut latest_state = None;
+     for msg in messages {
+       match msg {
+-        sync::SyncMessage::RoomCreated { code, .. } => {
++        sync::SyncMessage::RoomCreated {
++          code,
++          features,
++          you,
++          queue_revision,
++          ..
++        } => {
+           let mut app = self.app.lock().await;
+           if let Some(session) = app.party_session_mut() {
+             session.code = code;
++            session.queue_enabled = features.iter().any(|feature| feature == "queue");
++            session.queue_revision = queue_revision;
++            if let Some(you) = you {
++              session.participant_id = you.id;
++              session.self_name = you.name;
++              session.host_name = session.self_name.clone();
++            }
+           }
++          app.start_party_queue();
+         }
+         sync::SyncMessage::JoinedRoom {
+           host_name,
+           control_mode,
++          features,
++          you,
++          queue_revision,
++          ..
+         } => {
+           let mut app = self.app.lock().await;
+           if let Some(session) = app.party_session_mut() {
+             session.host_name = host_name;
++            session.queue_enabled = features.iter().any(|feature| feature == "queue");
++            session.queue_revision = queue_revision;
+             if let Some(mode) = control_mode {
+               session.control_mode = sync::ControlMode::from_wire(&mode);
+             }
++            if let Some(you) = you {
++              session.participant_id = you.id;
++              session.self_name = you.name;
++            }
+           }
+         }
+-        sync::SyncMessage::GuestJoined { name } => {
+-          let mut app = self.app.lock().await;
+-          if let Some(session) = app.party_session_mut() {
+-            if !session.guests.contains(&name) {
+-              session.guests.push(name.clone());
++        sync::SyncMessage::GuestJoined { id, name } => {
++          let host_after_join = {
++            let mut app = self.app.lock().await;
++            if let Some(session) = app.party_session_mut() {
++              if !session.guests.contains(&name) {
++                session.guests.push(name.clone());
++              }
++              if !id.is_empty() && !session.members.iter().any(|member| member.id == id) {
++                session.members.push(crate::core::party::PartyMember::guest(
++                  id.clone(),
++                  name.clone(),
++                ));
++              }
+             }
++            let strings = app.strings();
++            app.set_status_message(strings.status.infra.party_joined(&name), 3);
++            app.party_is_host()
++          };
++          if host_after_join {
++            self.send_party_config().await;
++            self.send_party_snapshot(None).await;
++            self.sync_playback().await;
+           }
+-          let strings = app.strings();
+-          app.set_status_message(strings.status.infra.party_joined(&name), 3);
+         }
+-        sync::SyncMessage::GuestLeft { name } => {
++        sync::SyncMessage::GuestLeft { id, name } => {
+           let mut app = self.app.lock().await;
+           if let Some(session) = app.party_session_mut() {
+             if let Some(pos) = session.guests.iter().position(|g| g == &name) {
+               session.guests.remove(pos);
+             }
++            if !id.is_empty() {
++              session.members.retain(|member| member.id != id);
++            }
+           }
+           let strings = app.strings();
+           app.set_status_message(strings.status.infra.party_left(&name), 3);
++          let is_host = app.party_is_host();
++          drop(app);
++          if is_host {
++            self.send_party_config().await;
++          }
++        }
++        sync::SyncMessage::PartyConfig { config } => {
++          let mut app = self.app.lock().await;
++          app.party_queue_mut().config = config;
++        }
++        sync::SyncMessage::PartyMembers { members } => {
++          let mut app = self.app.lock().await;
++          app.party_queue_mut().set_members(members.clone());
++          if let Some(session) = app.party_session_mut() {
++            session.members = members;
++          }
++        }
++        sync::SyncMessage::QueueSnapshot(snapshot) => {
++          let full = self.party_snapshot_assembler.push(&snapshot);
++          if let Some(full) = full {
++            let mut app = self.app.lock().await;
++            app.party_queue_mut().apply_snapshot(&full);
++            if let Some(session) = app.party_session_mut() {
++              session.queue_revision = full.revision;
++              session.queue_enabled = true;
++            }
++          }
++        }
++        sync::SyncMessage::QueuePatch(patch) => {
++          let resync = {
++            let mut app = self.app.lock().await;
++            match app.party_queue_mut().apply_patch(&patch) {
++              Ok(()) => {
++                if let Some(session) = app.party_session_mut() {
++                  session.queue_revision = patch.revision;
++                }
++                false
++              }
++              Err(error) => error.code() == "stale_rev",
++            }
++          };
++          if resync {
++            let have_revision = {
++              let app = self.app.lock().await;
++              app.party_queue().revision
++            };
++            self
++              .send_party_message(&sync::SyncMessage::QueueResync {
++                have_revision,
++                from: None,
++                from_id: None,
++              })
++              .await;
++          }
++        }
++        sync::SyncMessage::QueueAck(ack) => {
++          if !ack.ok {
++            let mut app = self.app.lock().await;
++            let fallback = app.strings().popups.party_action_failed.to_string();
++            let message = ack.message.or(ack.error).unwrap_or(fallback);
++            app.set_status_message(&message, 4);
++          }
++        }
++        sync::SyncMessage::QueueCommand(command) => {
++          self.handle_party_queue_command(command).await;
++        }
++        sync::SyncMessage::QueueResync { from, from_id, .. } => {
++          let is_host = {
++            let app = self.app.lock().await;
++            app.party_is_host()
++          };
++          if is_host {
++            self.send_party_snapshot(from_id.or(from)).await;
++          }
+         }
+         sync::SyncMessage::SetControlMode { control_mode } => {
+           let mut app = self.app.lock().await;
+@@ -1813,25 +2250,40 @@ impl Network {
+         }
+         sync::SyncMessage::RoomClosed => {
+           self.party_connection = None;
++          self.party_incoming_rx = None;
++          self.party_snapshot_assembler = Default::default();
+           let mut app = self.app.lock().await;
+           app.set_party_status(sync::PartyStatus::Disconnected);
+           app.set_party_session(None);
++          app.reset_party_queue();
+           let strings = app.strings();
+           app.set_status_message(strings.status.infra.party_ended.to_string(), 5);
+         }
+         sync::SyncMessage::Error { message } => {
+-          self.party_connection = None;
+-          self.party_incoming_rx = None;
+-          let mut app = self.app.lock().await;
+-          app.set_party_status(sync::PartyStatus::Disconnected);
+-          app.set_party_session(None);
+-          {
+-            let strings = app.strings();
+-            app.handle_error_with_message(
+-              anyhow!("Party: {}", message),
+-              strings.status.infra.party_error(&message),
+-            )
+-          };
++          // Transport-level relay errors (rate limit, oversized frame) are not
++          // fatal to the room: surface them and keep the party alive.
++          let recoverable = message.to_ascii_lowercase().contains("rate limited")
++            || message.to_ascii_lowercase().contains("too large")
++            || message.to_ascii_lowercase().contains("message too");
++          if recoverable {
++            let mut app = self.app.lock().await;
++            app.set_status_message(&message, 4);
++          } else {
++            self.party_connection = None;
++            self.party_incoming_rx = None;
++            self.party_snapshot_assembler = Default::default();
++            let mut app = self.app.lock().await;
++            app.set_party_status(sync::PartyStatus::Disconnected);
++            app.set_party_session(None);
++            app.reset_party_queue();
++            {
++              let strings = app.strings();
++              app.handle_error_with_message(
++                anyhow!("Party: {}", message),
++                strings.status.infra.party_error(&message),
++              )
++            };
++          }
+         }
+         _ => {}
+       }
+@@ -1969,6 +2421,12 @@ impl Network {
+   }
+ }
+ 
++fn next_party_op_id() -> String {
++  use std::sync::atomic::{AtomicU64, Ordering};
++  static SEQ: AtomicU64 = AtomicU64::new(1);
++  format!("{}-{}", sync::now_ms(), SEQ.fetch_add(1, Ordering::Relaxed))
++}
++
+ /// Keep diagnostics and the CLI byte-identical while giving the UI a localized context.
+ fn report_request_error(app: &mut App, error: anyhow::Error) {
+   let message = app
+@@ -1982,6 +2440,106 @@ fn report_request_error(app: &mut App, error: anyhow::Error) {
+ #[cfg(test)]
+ mod tests {
+ 
++  /// Full host/guest relay test. Run with a relay:
++  /// `PARTY_RELAY_URL=ws://127.0.0.1:8080/ws cargo test -- ... --ignored`
++  #[tokio::test]
++  #[ignore = "requires a running party-relay"]
++  async fn two_apps_exchange_a_queue_add_through_the_real_relay() {
++    use std::time::Duration;
++    use tokio::time::Instant;
++
++    let relay =
++      std::env::var("PARTY_RELAY_URL").unwrap_or_else(|_| "ws://127.0.0.1:8080/ws".to_string());
++    let (host_app, _host_rx) = app_with_a_session();
++    let (guest_app, _guest_rx) = app_with_a_session();
++    for app in [&host_app, &guest_app] {
++      app.lock().await.user_config.behavior.relay_server_url = relay.clone();
++    }
++
++    let mut host = session_free_network(&host_app);
++    host.spotify = Some(SpotifyLogin::new());
++    host.start_party(sync::ControlMode::HostOnly).await;
++
++    let deadline = Instant::now() + Duration::from_secs(5);
++    let code = loop {
++      host.process_party_messages().await;
++      let code = {
++        let app = host_app.lock().await;
++        app
++          .party_session()
++          .map(|session| session.code.clone())
++          .filter(|code| !code.is_empty())
++      };
++      if let Some(code) = code {
++        break code;
++      }
++      assert!(Instant::now() < deadline, "host got no room code");
++      tokio::time::sleep(Duration::from_millis(20)).await;
++    };
++
++    let mut guest = session_free_network(&guest_app);
++    guest.spotify = Some(SpotifyLogin::new());
++    guest.join_party(code, "ana".to_string()).await;
++
++    let deadline = Instant::now() + Duration::from_secs(5);
++    loop {
++      host.process_party_messages().await;
++      let members = {
++        let app = host_app.lock().await;
++        app.party_session().map(|session| session.members.len())
++      };
++      if members.is_some_and(|len| len >= 2) {
++        break;
++      }
++      assert!(Instant::now() < deadline, "host did not see the guest");
++      tokio::time::sleep(Duration::from_millis(20)).await;
++    }
++
++    let deadline = Instant::now() + Duration::from_secs(5);
++    loop {
++      guest.process_party_messages().await;
++      let enabled = {
++        let app = guest_app.lock().await;
++        app
++          .party_session()
++          .is_some_and(|session| session.queue_enabled)
++      };
++      if enabled {
++        break;
++      }
++      assert!(Instant::now() < deadline, "guest did not enable the queue");
++      tokio::time::sleep(Duration::from_millis(20)).await;
++    }
++
++    guest
++      .party_queue_command(crate::core::party::QueueAction::Add {
++        uri: "spotify:track:7o2AeQZzfCERsRMOM86EcB".to_string(),
++        title: "Archangel".to_string(),
++        artists: vec!["Burial".to_string()],
++        duration_ms: 299_000,
++      })
++      .await;
++
++    let deadline = Instant::now() + Duration::from_secs(5);
++    loop {
++      host.process_party_messages().await;
++      guest.process_party_messages().await;
++      let converged = {
++        let host = host_app.lock().await;
++        let guest = guest_app.lock().await;
++        host.party_queue().items.len() == 1 && guest.party_queue().items.len() == 1
++      };
++      if converged {
++        break;
++      }
++      assert!(Instant::now() < deadline, "queue did not converge");
++      tokio::time::sleep(Duration::from_millis(20)).await;
++    }
++
++    host.leave_party().await;
++    guest.leave_party().await;
++  }
++
+   #[tokio::test]
+   async fn speaker_errors_use_the_active_ui_language_without_losing_the_error_route() {
+     use crate::core::i18n::{Language, LocalizedMessage};
+@@ -2638,9 +3196,14 @@ mod tests {
+       role,
+       code: "ABC123".to_string(),
+       guests: Vec::new(),
++      members: Vec::new(),
++      participant_id: "p-1".to_string(),
++      self_name: "Guest".to_string(),
+       control_mode: sync::ControlMode::HostOnly,
+       host_name: "Host".to_string(),
+       host_state_at: None,
++      queue_revision: 0,
++      queue_enabled: true,
+     }
+   }
+ 
+@@ -2654,10 +3217,15 @@ mod tests {
+   async fn party_network(app: &Arc<Mutex<App>>, role: sync::PartyRole) -> Network {
+     let mut network = session_free_network(app);
+     network.spotify = Some(SpotifyLogin::new());
+-    app
+-      .lock()
+-      .await
+-      .set_party_session(Some(party_session(role)));
++    let mut app_guard = app.lock().await;
++    app_guard.set_party_session(Some(party_session(role.clone())));
++    if role == sync::PartyRole::Host {
++      *app_guard.party_queue_mut() = crate::core::party::PartyQueue::with_host(
++        Default::default(),
++        crate::core::party::PartyMember::host("Host"),
++      );
++    }
++    drop(app_guard);
+     network
+   }
+ 
+@@ -2683,7 +3251,119 @@ mod tests {
+     sync::SyncMessage::PlaybackCommand {
+       action: sync::PlaybackAction::Pause,
+       from: None,
++      from_id: None,
++    }
++  }
++
++  fn party_item(id: u64) -> crate::core::party::PartyQueueItem {
++    crate::core::party::PartyQueueItem {
++      id,
++      uri: format!("spotify:track:{:022}", id),
++      title: format!("Track {id}"),
++      artists: vec!["Artist".to_string()],
++      duration_ms: 299_000,
++      added_by: "p-1".to_string(),
++      added_by_name: "ana".to_string(),
++      votes: 0,
++      added_at_ms: sync::now_ms(),
++    }
++  }
++
++  #[tokio::test]
++  async fn a_host_applies_a_guest_queue_command() {
++    let (app, _rx) = app_with_a_session();
++    let mut network = party_network(&app, sync::PartyRole::Host).await;
++
++    relay(
++      &mut network,
++      sync::SyncMessage::QueueCommand(crate::core::party::QueueCommand {
++        op_id: "op-1".to_string(),
++        from: Some("ana".to_string()),
++        from_id: Some("p-1".to_string()),
++        base_rev: 0,
++        action: crate::core::party::QueueAction::Add {
++          uri: "spotify:track:7o2AeQZzfCERsRmOM86EcB".to_string(),
++          title: "Archangel".to_string(),
++          artists: vec!["Burial".to_string()],
++          duration_ms: 299_000,
++        },
++      }),
++    )
++    .await;
++
++    let app = app.lock().await;
++    assert_eq!(app.party_queue().items.len(), 1);
++    assert_eq!(app.party_queue().items[0].added_by, "p-1");
++    assert_eq!(app.party_queue().revision, 1);
++  }
++
++  #[tokio::test]
++  async fn a_guest_applies_a_queue_patch() {
++    let (app, _rx) = app_with_a_session();
++    let mut network = party_network(&app, sync::PartyRole::Guest).await;
++    let item = party_item(1);
++
++    relay(
++      &mut network,
++      sync::SyncMessage::QueuePatch(crate::core::party::QueuePatch {
++        revision: 1,
++        ops: vec![crate::core::party::QueueOp::Add { item: item.clone() }],
++      }),
++    )
++    .await;
++
++    let app = app.lock().await;
++    assert_eq!(app.party_queue().items, vec![item]);
++    assert_eq!(app.party_queue().revision, 1);
++  }
++
++  #[tokio::test]
++  async fn a_guest_assembles_a_chunked_snapshot() {
++    let (app, _rx) = app_with_a_session();
++    let mut network = party_network(&app, sync::PartyRole::Guest).await;
++    let item = party_item(1);
++    for chunk in 0..2 {
++      relay(
++        &mut network,
++        sync::SyncMessage::QueueSnapshot(crate::core::party::PartyQueueSnapshot {
++          revision: 3,
++          snapshot_id: "s-1".to_string(),
++          chunk,
++          chunks: 2,
++          to: None,
++          current: None,
++          items: if chunk == 0 {
++            vec![item.clone()]
++          } else {
++            vec![]
++          },
++          history_tail: vec![],
++        }),
++      )
++      .await;
+     }
++    let app = app.lock().await;
++    assert_eq!(app.party_queue().revision, 3);
++    assert_eq!(app.party_queue().items.len(), 1);
++  }
++
++  #[tokio::test]
++  async fn guest_join_gets_a_member_entry() {
++    let (app, _rx) = app_with_a_session();
++    let mut network = party_network(&app, sync::PartyRole::Host).await;
++
++    relay(
++      &mut network,
++      sync::SyncMessage::GuestJoined {
++        id: "p-9".to_string(),
++        name: "Luis".to_string(),
++      },
++    )
++    .await;
++
++    let app = app.lock().await;
++    let session = app.party_session().unwrap();
++    assert!(session.members.iter().any(|member| member.id == "p-9"));
+   }
+ 
+   #[tokio::test]
+@@ -2768,6 +3448,7 @@ mod tests {
+           position_ms: u64::MAX,
+         },
+         from: None,
++        from_id: None,
+       },
+     )
+     .await;
+@@ -2824,20 +3505,23 @@ mod tests {
+ 
+   #[cfg(feature = "streaming")]
+   #[tokio::test]
+-  async fn the_relay_yields_to_the_native_queue_slot() {
++  async fn a_guest_queue_slot_stays_local_but_a_host_shares_a_queued_spotify_track() {
+     let (app, rx) = app_with_a_session();
+     app.lock().await.queue_now = Some(crate::infra::queue::QueueNowPlaying::Spotify {
+       track: crate::core::test_helpers::queued_track("spotify:track:queued", "Queued"),
+     });
+     let mut network = party_network(&app, sync::PartyRole::Guest).await;
+ 
++    // A guest never follows the host through its own queue slot.
+     relay(&mut network, host_state()).await;
+     assert!(rx.try_recv().is_err());
+ 
++    // A host playing a queued Spotify track keeps the party alive, so a
++    // shared-control guest can still pause it.
+     app.lock().await.party_session_mut().unwrap().role = sync::PartyRole::Host;
+     share_control(&app).await;
+     relay(&mut network, guest_pause()).await;
+-    assert!(rx.try_recv().is_err());
++    assert!(matches!(rx.try_recv(), Ok(IoEvent::PausePlayback)));
+   }
+ 
+   #[tokio::test]
+@@ -2854,6 +3538,7 @@ mod tests {
+     relay(
+       &mut network,
+       sync::SyncMessage::GuestJoined {
++        id: "p-1".to_string(),
+         name: "Guest".to_string(),
+       },
+     )
+diff --git a/src/infra/network/sync.rs b/src/infra/network/sync.rs
+index 9be9587..9a3fb6c 100644
+--- a/src/infra/network/sync.rs
++++ b/src/infra/network/sync.rs
+@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
+ use std::time::{SystemTime, UNIX_EPOCH};
+ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream};
+ 
++use crate::core::party::{
++  PartyMember, PartyQueueConfig, PartyQueueSnapshot, QueueAck, QueueCommand, QueuePatch,
++};
++
+ type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+ 
+ #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+@@ -57,17 +61,37 @@ pub enum SyncMessage {
+   RoomCreated {
+     code: String,
+     control_mode: String,
++    #[serde(default)]
++    protocol_version: Option<u8>,
++    #[serde(default)]
++    features: Vec<String>,
++    #[serde(default)]
++    you: Option<PartyMember>,
++    #[serde(default)]
++    queue_revision: u64,
+   },
+   JoinedRoom {
+     host_name: String,
+     /// Absent from a relay deployed before a late joiner learned the mode.
+     #[serde(default)]
+     control_mode: Option<String>,
++    #[serde(default)]
++    protocol_version: Option<u8>,
++    #[serde(default)]
++    features: Vec<String>,
++    #[serde(default)]
++    you: Option<PartyMember>,
++    #[serde(default)]
++    queue_revision: u64,
+   },
+   GuestJoined {
++    #[serde(default)]
++    id: String,
+     name: String,
+   },
+   GuestLeft {
++    #[serde(default)]
++    id: String,
+     name: String,
+   },
+   SyncState {
+@@ -79,6 +103,8 @@ pub enum SyncMessage {
+   PlaybackCommand {
+     action: PlaybackAction,
+     from: Option<String>,
++    #[serde(default)]
++    from_id: Option<String>,
+   },
+   SetControlMode {
+     control_mode: String,
+@@ -86,6 +112,30 @@ pub enum SyncMessage {
+   SetName {
+     name: String,
+   },
++  /// The host's queue policy and limits.
++  PartyConfig {
++    config: PartyQueueConfig,
++  },
++  /// The host's roster with stable participant ids.
++  PartyMembers {
++    members: Vec<PartyMember>,
++  },
++  /// A guest intent; the relay adds `from`/`from_id` before the host sees it.
++  QueueCommand(QueueCommand),
++  /// The host applied (or rejected) an intent.
++  QueueAck(QueueAck),
++  /// A host broadcast with one or more applied ops.
++  QueuePatch(QueuePatch),
++  /// A full queue, possibly in several chunks.
++  QueueSnapshot(PartyQueueSnapshot),
++  /// A guest detected a revision gap and asks for a snapshot.
++  QueueResync {
++    have_revision: u64,
++    #[serde(default)]
++    from: Option<String>,
++    #[serde(default)]
++    from_id: Option<String>,
++  },
+   Heartbeat,
+   Error {
+     message: String,
+@@ -124,10 +174,25 @@ pub struct PartySession {
+   pub role: PartyRole,
+   pub code: String,
+   pub guests: Vec<String>,
++  pub members: Vec<PartyMember>,
++  /// Stable id assigned by the relay. Empty on a v1 relay.
++  pub participant_id: String,
++  /// This client's display name; the host's name or the guest's chosen name.
++  pub self_name: String,
+   pub control_mode: ControlMode,
+   pub host_name: String,
+   /// When a guest last got a host state it follows; the host sends one every 2 s.
+   pub host_state_at: Option<std::time::Instant>,
++  /// Last queue revision this client knows about.
++  pub queue_revision: u64,
++  /// False on a relay that does not advertise the queue feature.
++  pub queue_enabled: bool,
++}
++
++impl PartySession {
++  pub fn supports_queue(&self) -> bool {
++    self.queue_enabled
++  }
+ }
+ 
+ pub struct PartyConnection {
+@@ -137,6 +202,13 @@ pub struct PartyConnection {
+ impl PartyConnection {
+   pub async fn send(&mut self, msg: &SyncMessage) -> Result<(), String> {
+     let json = serde_json::to_string(msg).map_err(|e| e.to_string())?;
++    if json.len() > MAX_RELAY_MESSAGE_BYTES {
++      return Err(format!(
++        "party message is {} bytes; the relay limit is {}",
++        json.len(),
++        MAX_RELAY_MESSAGE_BYTES
++      ));
++    }
+     self
+       .write
+       .send(Message::Text(json.into()))
+@@ -176,6 +248,55 @@ pub async fn connect_to_relay(
+   Ok((PartyConnection { write }, read))
+ }
+ 
++/// The relay drops frames larger than this; snapshots must be packed below it.
++pub const MAX_RELAY_MESSAGE_BYTES: usize = 4_096;
++/// Leave headroom for JSON escaping and for the `to` field the relay adds.
++pub const SNAPSHOT_BUDGET_BYTES: usize = 3_500;
++
++/// Pack a queue snapshot into relay-sized frames.
++///
++/// The split is by serialized size, not by a fixed item count: a 120-character
++/// CJK title costs more bytes than a short ASCII one. Every returned message is
++/// a complete `queue_snapshot` sharing `snapshot_id` and `revision`.
++pub fn queue_snapshot_messages(snapshot: &PartyQueueSnapshot) -> Vec<SyncMessage> {
++  let mut groups: Vec<Vec<_>> = Vec::new();
++  let mut current = Vec::new();
++  for item in &snapshot.items {
++    current.push(item.clone());
++    let probe = PartyQueueSnapshot {
++      chunk: 0,
++      chunks: 1,
++      items: current.clone(),
++      ..snapshot.clone()
++    };
++    let fits = serde_json::to_string(&SyncMessage::QueueSnapshot(probe))
++      .map(|json| json.len() <= SNAPSHOT_BUDGET_BYTES)
++      .unwrap_or(false);
++    if !fits && current.len() > 1 {
++      let last = current.pop().expect("just pushed");
++      groups.push(std::mem::take(&mut current));
++      current.push(last);
++    }
++  }
++  if !current.is_empty() || groups.is_empty() {
++    groups.push(current);
++  }
++
++  let chunks = groups.len().min(u16::MAX as usize) as u16;
++  groups
++    .into_iter()
++    .enumerate()
++    .map(|(index, items)| {
++      SyncMessage::QueueSnapshot(PartyQueueSnapshot {
++        chunk: index as u16,
++        chunks,
++        items,
++        ..snapshot.clone()
++      })
++    })
++    .collect()
++}
++
+ pub fn parse_sync_message(text: &str) -> Option<SyncMessage> {
+   match serde_json::from_str::<SyncMessage>(text) {
+     Ok(msg) => Some(msg),
+@@ -241,4 +362,213 @@ mod tests {
+       })
+     ));
+   }
++
++  #[test]
++  fn a_v2_room_created_carries_the_participant_and_feature() {
++    let msg = parse_sync_message(
++      r#"{"type":"room_created","code":"ABC123","control_mode":"host_only","protocol_version":2,"features":["queue"],"you":{"id":"host","name":"manu","role":"host"},"queue_revision":0}"#,
++    );
++    match msg {
++      Some(SyncMessage::RoomCreated {
++        code,
++        protocol_version,
++        features,
++        you,
++        ..
++      }) => {
++        assert_eq!(code, "ABC123");
++        assert_eq!(protocol_version, Some(2));
++        assert_eq!(features, vec!["queue".to_string()]);
++        assert_eq!(you.unwrap().id, "host");
++      }
++      other => panic!("unexpected message: {other:?}"),
++    }
++  }
++
++  fn item(id: u64) -> crate::core::party::PartyQueueItem {
++    crate::core::party::PartyQueueItem {
++      id,
++      uri: format!("spotify:track:{:022}", id),
++      title: "Título largo con acentos y 日本語".repeat(4),
++      artists: vec!["Artista".repeat(10)],
++      duration_ms: 299_000,
++      added_by: "p-1".into(),
++      added_by_name: "ana".into(),
++      votes: 0,
++      added_at_ms: 1_762_891_200_000,
++    }
++  }
++
++  #[test]
++  fn queue_snapshot_is_chunked_below_the_relay_limit() {
++    let snapshot = PartyQueueSnapshot {
++      revision: 4,
++      snapshot_id: "s-1".into(),
++      chunk: 0,
++      chunks: 1,
++      to: None,
++      current: Some(item(0)),
++      items: (1..=100).map(item).collect(),
++      history_tail: vec![],
++    };
++    let messages = queue_snapshot_messages(&snapshot);
++    assert!(
++      messages.len() > 1,
++      "100 long items must not fit in one frame"
++    );
++    let mut seen = 0;
++    for message in &messages {
++      let json = serde_json::to_string(message).unwrap();
++      assert!(
++        json.len() <= MAX_RELAY_MESSAGE_BYTES,
++        "frame is {} bytes",
++        json.len()
++      );
++      match message {
++        SyncMessage::QueueSnapshot(part) => {
++          assert_eq!(part.revision, 4);
++          assert_eq!(part.snapshot_id, "s-1");
++          seen += part.items.len();
++        }
++        _ => panic!("unexpected frame"),
++      }
++    }
++    assert_eq!(seen, 100);
++  }
++
++  #[test]
++  fn an_empty_queue_snapshot_still_produces_one_frame() {
++    let snapshot = PartyQueueSnapshot {
++      revision: 0,
++      snapshot_id: "empty".into(),
++      chunk: 0,
++      chunks: 1,
++      to: None,
++      current: None,
++      items: vec![],
++      history_tail: vec![],
++    };
++    let messages = queue_snapshot_messages(&snapshot);
++    assert_eq!(messages.len(), 1);
++    assert!(serde_json::to_string(&messages[0]).unwrap().len() < 200);
++  }
++
++  #[test]
++  fn queue_messages_serialize_with_their_fields_at_the_top_level() {
++    let ack = serde_json::to_value(SyncMessage::QueueAck(QueueAck {
++      op_id: "op-1".into(),
++      ok: true,
++      error: None,
++      message: None,
++      revision: 3,
++      to: Some("p-1".into()),
++    }))
++    .unwrap();
++    assert_eq!(ack["type"], "queue_ack");
++    assert_eq!(ack["op_id"], "op-1");
++    assert_eq!(ack["revision"], 3);
++
++    let command = serde_json::to_value(SyncMessage::QueueCommand(QueueCommand {
++      op_id: "op-2".into(),
++      from: None,
++      from_id: None,
++      base_rev: 3,
++      action: crate::core::party::QueueAction::Clear,
++    }))
++    .unwrap();
++    assert_eq!(command["type"], "queue_command");
++    assert_eq!(command["action"]["op"], "clear");
++  }
++
++  /// End-to-end wire test against a real relay. Run with:
++  /// `PARTY_RELAY_URL=ws://127.0.0.1:8080/ws cargo test -- ... --ignored`
++  #[tokio::test]
++  #[ignore = "requires a running party-relay"]
++  async fn relay_roundtrip_carries_a_queue_command_from_a_guest() {
++    use futures::StreamExt;
++
++    let relay =
++      std::env::var("PARTY_RELAY_URL").unwrap_or_else(|_| "ws://127.0.0.1:8080/ws".to_string());
++    let (_host, mut host_read) = connect_to_relay(
++      &relay,
++      "create",
++      &[("v", "2"), ("features", "queue"), ("name", "host")],
++    )
++    .await
++    .expect("host connects");
++    let created = tokio::time::timeout(std::time::Duration::from_secs(5), host_read.next())
++      .await
++      .expect("room_created timeout")
++      .expect("room_created frame")
++      .expect("room_created text");
++    let created = match created {
++      Message::Text(text) => parse_sync_message(&text).expect("room_created parse"),
++      other => panic!("unexpected frame: {other:?}"),
++    };
++    let code = match created {
++      SyncMessage::RoomCreated { code, .. } => code,
++      other => panic!("unexpected message: {other:?}"),
++    };
++
++    let (mut guest, _guest_read) = connect_to_relay(
++      &relay,
++      "join",
++      &[
++        ("code", &code),
++        ("v", "2"),
++        ("features", "queue"),
++        ("name", "ana"),
++      ],
++    )
++    .await
++    .expect("guest connects");
++    guest
++      .send(&SyncMessage::QueueCommand(QueueCommand {
++        op_id: "relay-roundtrip".into(),
++        from: None,
++        from_id: None,
++        base_rev: 0,
++        action: crate::core::party::QueueAction::Add {
++          uri: "spotify:track:7o2AeQZzfCERsRmOM86EcB".into(),
++          title: "Archangel".into(),
++          artists: vec!["Burial".into()],
++          duration_ms: 299_000,
++        },
++      }))
++      .await
++      .expect("command sent");
++
++    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
++    loop {
++      let frame = tokio::time::timeout_at(deadline, host_read.next())
++        .await
++        .expect("command timeout")
++        .expect("command frame")
++        .expect("command text");
++      let message = match frame {
++        Message::Text(text) => parse_sync_message(&text).expect("command parse"),
++        _ => continue,
++      };
++      if let SyncMessage::QueueCommand(command) = message {
++        assert_eq!(command.op_id, "relay-roundtrip");
++        assert_eq!(command.from.as_deref(), Some("ana"));
++        assert!(command.from_id.is_some());
++        return;
++      }
++    }
++  }
++
++  #[test]
++  fn queue_command_from_an_old_client_gets_defaults() {
++    let msg = parse_sync_message(
++      r#"{"type":"queue_command","op_id":"a1","base_rev":0,"action":{"op":"remove","id":3}}"#,
++    );
++    match msg {
++      Some(SyncMessage::QueueCommand(command)) => {
++        assert_eq!(command.op_id, "a1");
++        assert!(command.from.is_none());
++      }
++      other => panic!("unexpected message: {other:?}"),
++    }
++  }
+ }
+diff --git a/src/tui/handlers/party.rs b/src/tui/handlers/party.rs
+index a20c9d7..72f91a1 100644
+--- a/src/tui/handlers/party.rs
++++ b/src/tui/handlers/party.rs
+@@ -1,5 +1,5 @@
+ use crate::core::action::Action;
+-use crate::core::app::App;
++use crate::core::app::{ActiveBlock, App, RouteId};
+ use crate::infra::network::sync::PartyStatus;
+ use crate::tui::event::Key;
+ 
+@@ -113,6 +113,9 @@ fn handle_hosting_menu(key: Key, app: &mut App) {
+     Key::Char('c') | Key::Char('C') => {
+       app.apply(Action::TogglePartyControlMode);
+     }
++    Key::Char('Q') => {
++      app.push_navigation_stack(RouteId::Queue, ActiveBlock::Queue);
++    }
+     _ => {}
+   }
+ }
+@@ -125,6 +128,9 @@ fn handle_joined_menu(key: Key, app: &mut App) {
+     Key::Char('l') | Key::Char('L') => {
+       app.apply(Action::LeaveParty);
+     }
++    Key::Char('Q') => {
++      app.push_navigation_stack(RouteId::Queue, ActiveBlock::Queue);
++    }
+     _ => {}
+   }
+ }
+@@ -133,6 +139,34 @@ fn handle_joined_menu(key: Key, app: &mut App) {
+ mod tests {
+   use super::*;
+   use crate::core::app::{ActiveBlock, RouteId};
++  use crate::infra::network::sync::{ControlMode, PartyRole, PartySession, PartyStatus};
++
++  #[test]
++  fn q_opens_the_shared_queue_while_hosting_or_joined() {
++    for role in [PartyRole::Host, PartyRole::Guest] {
++      let mut app = App::default();
++      app.set_party_status(if role == PartyRole::Host {
++        PartyStatus::Hosting
++      } else {
++        PartyStatus::Joined
++      });
++      app.set_party_session(Some(PartySession {
++        role,
++        code: "ABC123".to_string(),
++        guests: Vec::new(),
++        members: Vec::new(),
++        participant_id: "p-1".to_string(),
++        self_name: "ana".to_string(),
++        control_mode: ControlMode::HostOnly,
++        host_name: "Host".to_string(),
++        host_state_at: None,
++        queue_revision: 0,
++        queue_enabled: true,
++      }));
++      handler(Key::Char('Q'), &mut app);
++      assert_eq!(app.get_current_route().id, RouteId::Queue);
++    }
++  }
+ 
+   /// Open the code-entry view and type `keys` into it, all through key presses.
+   fn app_typing(keys: &str) -> App {
+diff --git a/src/tui/handlers/queue_menu.rs b/src/tui/handlers/queue_menu.rs
+index 380ebd0..862bdb0 100644
+--- a/src/tui/handlers/queue_menu.rs
++++ b/src/tui/handlers/queue_menu.rs
+@@ -29,6 +29,13 @@ pub fn handler(key: Key, app: &mut App) {
+ }
+ 
+ fn queue_item_uri(app: &App, position: usize) -> Option<String> {
++  if app.party_is_active() {
++    return app
++      .party_queue()
++      .items
++      .get(position)
++      .map(|item| item.uri.clone());
++  }
+   app.native_queue.get(position).and_then(|t| t.uri.clone())
+ }
+ 
+@@ -49,6 +56,9 @@ fn play_selected(app: &mut App) {
+ 
+ /// Total selectable rows: the now-playing header plus every queue item.
+ fn row_count(app: &App) -> usize {
++  if app.party_is_active() {
++    return 1 + app.party_queue().items.len();
++  }
+   1 + app.native_queue.len()
+ }
+ 
+@@ -86,7 +96,11 @@ fn reorder(delta: i32, app: &mut App) {
+     return;
+   }
+   let idx = selected - 1;
+-  let len = app.native_queue.len();
++  let len = if app.party_is_active() {
++    app.party_queue().items.len()
++  } else {
++    app.native_queue.len()
++  };
+   let Some(uri) = queue_item_uri(app, idx) else {
+     return;
+   };
+diff --git a/src/tui/ui/popups.rs b/src/tui/ui/popups.rs
+index 1416b4a..afc44e3 100644
+--- a/src/tui/ui/popups.rs
++++ b/src/tui/ui/popups.rs
+@@ -500,16 +500,25 @@ pub fn draw_queue_in(f: &mut Frame<'_>, app: &App, area: Rect) {
+ 
+   // Row 0: "Now playing" header. Prefer the native queue slot's current track;
+   // fall back to the Spotify Web-API mirror (external Connect device) otherwise.
+-  let now_text = app
+-    .queue_now_display()
+-    .or_else(|| {
+-      app
+-        .queue
+-        .as_ref()
+-        .and_then(|q| q.currently_playing.as_ref())
+-        .map(|item| queue_item_line(item, app.strings()))
+-    })
+-    .unwrap_or_else(|| "—".to_string());
++  let now_text = if app.party_is_active() {
++    app
++      .party_queue()
++      .current
++      .as_ref()
++      .map(|item| format!("{} - {}", item.title, item.artists.join(", ")))
++      .unwrap_or_else(|| "—".to_string())
++  } else {
++    app
++      .queue_now_display()
++      .or_else(|| {
++        app
++          .queue
++          .as_ref()
++          .and_then(|q| q.currently_playing.as_ref())
++          .map(|item| queue_item_line(item, app.strings()))
++      })
++      .unwrap_or_else(|| "—".to_string())
++  };
+   items.push(
+     ListItem::new(Line::from(vec![
+       Span::styled(
+@@ -521,8 +530,22 @@ pub fn draw_queue_in(f: &mut Frame<'_>, app: &App, area: Rect) {
+     .style(style),
+   );
+ 
+-  // The native queue is the selectable list.
+-  if app.native_queue.is_empty() {
++  // The party queue is the selectable list while a jam is active.
++  if app.party_is_active() {
++    if app.party_queue().items.is_empty() {
++      items.push(ListItem::new(Span::raw(app.strings().popups.party_queue_empty)).style(style));
++    } else {
++      for item in &app.party_queue().items {
++        let line = format!(
++          "{} - {}  · {}",
++          item.title,
++          item.artists.join(", "),
++          item.added_by_name
++        );
++        items.push(ListItem::new(line).style(style));
++      }
++    }
++  } else if app.native_queue.is_empty() {
+     // With an empty native queue, fall back to displaying the legacy Spotify
+     // mirror only when controlling an external Connect device (the queue there
+     // lives Spotify-side). Otherwise show a hint.
+@@ -567,7 +590,11 @@ pub fn draw_queue_in(f: &mut Frame<'_>, app: &App, area: Rect) {
+   // appended after the selectable native-queue rows; selection stays confined to
+   // those rows (queue_menu.rs counts only `1 + native_queue.len()` rows), so
+   // these extra rows never receive the highlight.
+-  let preview = context_preview_lines(app, 5);
++  let preview = if app.party_is_active() {
++    Vec::new()
++  } else {
++    context_preview_lines(app, 5)
++  };
+   if !preview.is_empty() {
+     let header_style = Style::default().fg(app.user_config.theme.hint.into());
+     let row_style = Style::default()
+@@ -1715,13 +1742,96 @@ pub fn draw_sort_menu(f: &mut Frame<'_>, app: &App) {
+   f.render_stateful_widget(list, rect, &mut state);
+ }
+ 
++fn push_party_queue_lines(
++  app: &App,
++  lines: &mut Vec<Line>,
++  style: Style,
++  active_style: Style,
++  hint_style: Style,
++) {
++  let queue = app.party_queue();
++  lines.push(Line::from(Span::styled(
++    app
++      .strings()
++      .popups
++      .party_queue_title(queue.revision, queue.items.len()),
++    hint_style,
++  )));
++  if let Some(current) = &queue.current {
++    lines.push(Line::from(vec![
++      Span::styled("▶ ", active_style),
++      Span::styled(truncate(&current.title, 38), style),
++      Span::styled(" — ", hint_style),
++      Span::styled(truncate(&current.artists.join(", "), 24), hint_style),
++    ]));
++  } else {
++    lines.push(Line::from(Span::styled(
++      app.strings().popups.party_queue_current_none,
++      hint_style,
++    )));
++  }
++  if queue.items.is_empty() {
++    lines.push(Line::from(Span::styled(
++      app.strings().popups.party_queue_empty,
++      hint_style,
++    )));
++  } else {
++    for (index, item) in queue.items.iter().take(6).enumerate() {
++      lines.push(Line::from(vec![
++        Span::styled(format!("{}. ", index + 1), hint_style),
++        Span::styled(truncate(&item.title, 32), style),
++        Span::styled(" — ", hint_style),
++        Span::styled(truncate(&item.artists.join(", "), 18), hint_style),
++        Span::styled(
++          format!(" · {}", truncate(&item.added_by_name, 12)),
++          hint_style,
++        ),
++      ]));
++    }
++    if queue.items.len() > 6 {
++      lines.push(Line::from(Span::styled(
++        app.strings().popups.party_queue_more(queue.items.len() - 6),
++        hint_style,
++      )));
++    }
++  }
++  lines.push(Line::from(Span::styled(
++    app.strings().popups.party_queue_hint,
++    hint_style,
++  )));
++}
++
++fn truncate(value: &str, max: usize) -> String {
++  let mut chars = value.chars();
++  let mut out: String = chars.by_ref().take(max).collect();
++  if chars.next().is_some() {
++    out.pop();
++    out.push('…');
++  }
++  out
++}
++
+ pub fn draw_party(f: &mut Frame<'_>, app: &App) {
+   let [area] = f
+     .area()
+     .layout(&Layout::vertical([Constraint::Percentage(100)]).margin(2));
+ 
+-  let popup_width = 50u16.min(area.width);
+-  let popup_height = 16u16.min(area.height);
++  let queue_open = matches!(
++    app.party_status(),
++    PartyStatus::Hosting | PartyStatus::Joined
++  ) && app
++    .party_session()
++    .is_some_and(|session| session.supports_queue());
++  let popup_width = if queue_open {
++    72u16.min(area.width)
++  } else {
++    50u16.min(area.width)
++  };
++  let popup_height = if queue_open {
++    30u16.min(area.height)
++  } else {
++    16u16.min(area.height)
++  };
+   let popup_x = (area.width.saturating_sub(popup_width)) / 2 + area.x;
+   let popup_y = (area.height.saturating_sub(popup_height)) / 2 + area.y;
+   let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+@@ -1892,6 +2002,8 @@ pub fn draw_party(f: &mut Frame<'_>, app: &App) {
+           }
+         }
+         lines.push(Line::from(""));
++        push_party_queue_lines(app, &mut lines, style, active_style, hint_style);
++        lines.push(Line::from(""));
+         lines.push(Line::from(Span::styled(
+           app.strings().popups.party_toggle_control,
+           hint_style,
+@@ -1926,6 +2038,8 @@ pub fn draw_party(f: &mut Frame<'_>, app: &App) {
+           Span::styled(app.strings().popups.following_host, hint_style),
+         ]));
+         lines.push(Line::from(""));
++        push_party_queue_lines(app, &mut lines, style, active_style, hint_style);
++        lines.push(Line::from(""));
+         lines.push(Line::from(Span::styled(
+           app.strings().popups.party_leave,
+           hint_style,
+@@ -2175,3 +2289,98 @@ mod playlist_picker_localization_tests {
+     }
+   }
+ }
++
++#[cfg(test)]
++mod party_queue_tests {
++  use super::*;
++  use crate::core::app::App;
++  use crate::core::party::{PartyMember, PartyQueue, PartyQueueItem, PartyQueueSnapshot};
++  use crate::infra::network::sync::{ControlMode, PartyRole, PartySession, PartyStatus};
++  use ratatui::{backend::TestBackend, Terminal};
++
++  fn item(id: u64, title: &str, by: &str) -> PartyQueueItem {
++    PartyQueueItem {
++      id,
++      uri: format!("spotify:track:{:022}", id),
++      title: title.to_string(),
++      artists: vec!["Burial".to_string()],
++      duration_ms: 299_000,
++      added_by: by.to_string(),
++      added_by_name: "ana".to_string(),
++      votes: 0,
++      added_at_ms: 1_762_891_200_000,
++    }
++  }
++
++  fn app_with_party(role: PartyRole) -> App {
++    let mut app = App::default();
++    app.set_party_status(if role == PartyRole::Host {
++      PartyStatus::Hosting
++    } else {
++      PartyStatus::Joined
++    });
++    app.set_party_session(Some(PartySession {
++      role,
++      code: "ABC123".to_string(),
++      guests: vec!["ana".to_string()],
++      members: vec![PartyMember::host("manu"), PartyMember::guest("p-1", "ana")],
++      participant_id: "p-1".to_string(),
++      self_name: "ana".to_string(),
++      control_mode: ControlMode::HostOnly,
++      host_name: "manu".to_string(),
++      host_state_at: None,
++      queue_revision: 2,
++      queue_enabled: true,
++    }));
++    let mut queue = PartyQueue::with_host(Default::default(), PartyMember::host("manu"));
++    queue.apply_snapshot(&PartyQueueSnapshot {
++      revision: 2,
++      snapshot_id: "test".to_string(),
++      chunk: 0,
++      chunks: 1,
++      to: None,
++      current: Some(item(1, "Archangel", "host")),
++      items: vec![item(2, "Halcyon", "p-1"), item(3, "Xtal", "p-1")],
++      history_tail: vec![],
++    });
++    *app.party_queue_mut() = queue;
++    app.bump_display(crate::core::app::DisplayDomain::Queue);
++    app
++  }
++
++  fn render(app: &App, width: u16, height: u16, draw: fn(&mut Frame<'_>, &App)) -> String {
++    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
++    terminal.draw(|frame| draw(frame, app)).unwrap();
++    let buffer = terminal.backend().buffer();
++    (0..buffer.area.height)
++      .map(|y| {
++        (0..buffer.area.width)
++          .map(|x| buffer[(x, y)].symbol())
++          .collect::<String>()
++      })
++      .collect::<Vec<_>>()
++      .join("\n")
++  }
++
++  #[test]
++  fn the_party_popup_shows_the_shared_queue_and_its_authors() {
++    let app = app_with_party(PartyRole::Guest);
++    let text = render(&app, 100, 40, draw_party);
++    assert!(text.contains("Archangel"), "{text}");
++    assert!(text.contains("Halcyon"), "{text}");
++    assert!(text.contains("ana"), "{text}");
++    assert!(
++      text.contains(app.strings().popups.party_queue_hint),
++      "{text}"
++    );
++  }
++
++  #[test]
++  fn the_queue_screen_reads_the_party_mirror() {
++    let app = app_with_party(PartyRole::Guest);
++    let text = render(&app, 100, 30, draw_queue);
++    assert!(text.contains("Archangel"), "{text}");
++    assert!(text.contains("Halcyon"), "{text}");
++    assert!(text.contains("Xtal"), "{text}");
++  }
++}
+diff --git a/worker-relay/.gitignore b/worker-relay/.gitignore
+new file mode 100644
+index 0000000..1c94436
+--- /dev/null
++++ b/worker-relay/.gitignore
+@@ -0,0 +1,3 @@
++.test-build/
++.wrangler/
++node_modules/
+diff --git a/worker-relay/README.md b/worker-relay/README.md
+new file mode 100644
+index 0000000..0998fa6
+--- /dev/null
++++ b/worker-relay/README.md
+@@ -0,0 +1,145 @@
++# Spotatui party relay
++
++Cloudflare Worker that relays the Spotatui Listening Party. Connections are
++routed by 6-character room code to a `PartyRoom` Durable Object; IP create/join
++attempts are limited by a second Durable Object.
++
++The relay is **dumb**: it routes and shapes JSON, enforces direction and rate
++limits, and never stores the Party Queue. The host owns the queue and its
++revision.
++
++## Endpoints
++
++`GET /ws` with `Upgrade: websocket`.
++
++| Action | URL |
++| --- | --- |
++| Create | `/ws?action=create&control_mode=host_only&name=manu` |
++| Join | `/ws?action=join&code=ABC123&name=ana` |
++
++`control_mode` is `host_only` (default) or `shared_control`. `name` is optional
++on create (default `Host`) and required on join. A v2 client adds
++`v=2&features=queue`, but the relay does not require those parameters: a v1
++client keeps working unchanged.
++
++## Protocol v2
++
++`room_created` and `joined_room` carry the additive v2 handshake fields:
++
++```json
++{
++  "type": "room_created",
++  "code": "ABC123",
++  "control_mode": "host_only",
++  "protocol_version": 2,
++  "features": ["queue"],
++  "playback_mode": "follow_host",
++  "queue_revision": 0,
++  "you": { "id": "host", "name": "manu", "role": "host" }
++}
++```
++
++```json
++{
++  "type": "joined_room",
++  "host_name": "manu",
++  "control_mode": "host_only",
++  "protocol_version": 2,
++  "features": ["queue"],
++  "playback_mode": "follow_host",
++  "queue_revision": 0,
++  "you": { "id": "7f3a2c9e-...", "name": "ana", "role": "guest" }
++}
++```
++
++- The host id is always `host`; a guest id is the relay UUID assigned to that
++  session. `added_by` / `from_id` values come from these ids, never from the
++  client.
++- `queue_revision` is always `0` from the relay. It cannot track the queue; it
++  is only a handshake hint. A late joiner must still ask the host for a
++  `queue_snapshot`.
++- `features` is `[]` when `QUEUE_ENABLED=0`; v2 clients then hide the queue and
++  the room behaves as a Listening Party.
++- `guest_joined` and `guest_left` include both `id` and `name`. They are still
++  emitted on join, leave and `set_name`.
++
++### Direction matrix
++
++| Sender | Type | Destination |
++| --- | --- | --- |
++| Host | `party_config`, `party_members`, `queue_patch` | everyone else |
++| Host | `sync_state`, `heartbeat` | everyone else |
++| Host | `set_control_mode` | everyone (canonicalized to `host_only` / `shared_control`) |
++| Host | `queue_snapshot`, `queue_ack` | everyone else when `to` is absent |
++| Host | `queue_snapshot`, `queue_ack` with `to` | that guest only; unknown ids are dropped |
++| Guest | `queue_command`, `queue_resync` | host |
++| Guest | `playback_command` | host, only in `shared_control` |
++| Either | `set_name` | internal: updates the participant name |
++| Guest | `queue_patch`, `queue_snapshot`, `queue_ack`, `party_*` | dropped |
++| Host | `queue_command`, `queue_resync` | dropped |
++
++For guest-to-host messages the relay overwrites `from` with the session display
++name and adds `from_id` with the relay participant id, discarding whatever the
++client sent in either field. Queue commands are accepted only from guests; the
++relay never validates queue permissions, because the host is the authority.
++
++`queue_command` has a per-session token bucket: burst 10, refill 2/s. Exceeding
++it drops the command and sends `{"type":"error","message":"Rate limited"}`.
++Other limits are unchanged: 4 KiB per frame (configurable), 8 participants,
++1 host, 2 guests per IP, 10 create and 10 join attempts per IP per hour, and a
++5-minute inactivity expiry.
++
++`sync_state`, `playback_command`, `set_control_mode`, `set_name`, `heartbeat`,
++`error` and `room_closed` remain supported; the queue changes only add fields.
++Unknown client types and `queue_*` from the wrong role are ignored without
++closing the socket.
++
++The full wire specification is in
++[`docs/protocolo-party-v2.md`](../../../docs/protocolo-party-v2.md).
++
++## Configuration
++
++| Variable | Default | Meaning |
++| --- | --- | --- |
++| `MAX_MESSAGE_BYTES` | `4096` | UTF-8 bytes allowed per frame; values below 512 or above 1 MiB fall back to 4096. |
++| `QUEUE_ENABLED` | `1` | `0` / `false` / `off` / `no` disables `queue_*` routing and advertises `features: []`. |
++
++Both live in `wrangler.toml` under `[vars]` (and `[env.staging.vars]`). The
++default 4096 matches the reference protocol; raising it is possible but clients
++may reject oversized frames.
++
++## Develop, test, deploy
++
++Node 20 can run the typecheck and tests. `wrangler` 4.x requires Node >= 22, so
++on Node 20 do not run `wrangler dev` / `wrangler deploy`; use Node 22 for those.
++`npm ci` on Node 20 completes, but npm prints `EBADENGINE` warnings for
++`wrangler`/`miniflare`; that is expected and does not affect `tsc` or the tests.
++
++```bash
++npm ci
++npx tsc --noEmit          # typecheck, no wrangler needed
++npm test                  # compiles routing.ts + tests to .test-build, node --test
++npm run dev               # needs Node >= 22
++```
++
++Production is the top-level configuration (`spotatui-party`):
++
++```bash
++npm run deploy
++```
++
++Staging is a separate Worker (`spotatui-party-staging`) with its own Durable
++Object namespaces:
++
++```bash
++npm run deploy:staging
++```
++
++Deploy the relay **before** the v2 client. v1 hosts/guests keep working against
++a v2 relay; a v2 client against a v1 relay sees no `protocol_version`/`features`
++and disables the queue.
++
++The first deployment of each environment creates the Durable Object classes
++through the `v1` and `v2` migration tags above. Do not reuse one environment's
++namespace for the other. No account id or route is committed; `wrangler` uses the
++logged-in account and the default `workers.dev` route.
+diff --git a/worker-relay/package-lock.json b/worker-relay/package-lock.json
+index ca71cc0..b331961 100644
+--- a/worker-relay/package-lock.json
++++ b/worker-relay/package-lock.json
+@@ -9,6 +9,7 @@
+       "version": "1.0.0",
+       "devDependencies": {
+         "@cloudflare/workers-types": "^5.20260808.1",
++        "@types/node": "^20.19.43",
+         "typescript": "^5.3.0",
+         "wrangler": "^4.156.0"
+       }
+@@ -715,9 +716,6 @@
+         "arm"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "LGPL-3.0-or-later",
+       "optional": true,
+       "os": [
+@@ -735,9 +733,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "LGPL-3.0-or-later",
+       "optional": true,
+       "os": [
+@@ -755,9 +750,6 @@
+         "ppc64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "LGPL-3.0-or-later",
+       "optional": true,
+       "os": [
+@@ -775,9 +767,6 @@
+         "riscv64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "LGPL-3.0-or-later",
+       "optional": true,
+       "os": [
+@@ -795,9 +784,6 @@
+         "s390x"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "LGPL-3.0-or-later",
+       "optional": true,
+       "os": [
+@@ -815,9 +801,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "LGPL-3.0-or-later",
+       "optional": true,
+       "os": [
+@@ -835,9 +818,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "LGPL-3.0-or-later",
+       "optional": true,
+       "os": [
+@@ -855,9 +835,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "LGPL-3.0-or-later",
+       "optional": true,
+       "os": [
+@@ -875,9 +852,6 @@
+         "arm"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "Apache-2.0",
+       "optional": true,
+       "os": [
+@@ -901,9 +875,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "Apache-2.0",
+       "optional": true,
+       "os": [
+@@ -927,9 +898,6 @@
+         "ppc64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "Apache-2.0",
+       "optional": true,
+       "os": [
+@@ -953,9 +921,6 @@
+         "riscv64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "Apache-2.0",
+       "optional": true,
+       "os": [
+@@ -979,9 +944,6 @@
+         "s390x"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "Apache-2.0",
+       "optional": true,
+       "os": [
+@@ -1005,9 +967,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "Apache-2.0",
+       "optional": true,
+       "os": [
+@@ -1031,9 +990,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "Apache-2.0",
+       "optional": true,
+       "os": [
+@@ -1057,9 +1013,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "Apache-2.0",
+       "optional": true,
+       "os": [
+@@ -1249,6 +1202,15 @@
+       "dev": true,
+       "license": "CC0-1.0"
+     },
++    "node_modules/@types/node": {
++      "version": "20.19.43",
++      "resolved": "https://registry.npmjs.org/@types/node/-/node-20.19.43.tgz",
++      "integrity": "sha512-6oYBAi5ikg4Pl+kGsoYtawUMBT2zZMCvPNF7pVLnHZfd1zf38DRiWn/gT01RYCdUqkv7Fhr+C9ot4/tb+2sVvA==",
++      "dev": true,
++      "dependencies": {
++        "undici-types": "~6.21.0"
++      }
++    },
+     "node_modules/blake3-wasm": {
+       "version": "2.1.5",
+       "resolved": "https://registry.npmjs.org/blake3-wasm/-/blake3-wasm-2.1.5.tgz",
+@@ -1497,6 +1459,12 @@
+         "node": ">=20.18.1"
+       }
+     },
++    "node_modules/undici-types": {
++      "version": "6.21.0",
++      "resolved": "https://registry.npmjs.org/undici-types/-/undici-types-6.21.0.tgz",
++      "integrity": "sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ==",
++      "dev": true
++    },
+     "node_modules/unenv": {
+       "version": "2.0.0-rc.24",
+       "resolved": "https://registry.npmjs.org/unenv/-/unenv-2.0.0-rc.24.tgz",
+diff --git a/worker-relay/package.json b/worker-relay/package.json
+index c30abf1..16bfaea 100644
+--- a/worker-relay/package.json
++++ b/worker-relay/package.json
+@@ -2,12 +2,17 @@
+   "name": "spotatui-party-relay",
+   "version": "1.0.0",
+   "private": true,
++  "type": "module",
+   "scripts": {
+     "dev": "wrangler dev",
+-    "deploy": "wrangler deploy"
++    "deploy": "wrangler deploy",
++    "deploy:staging": "wrangler deploy --env staging",
++    "typecheck": "tsc --noEmit",
++    "test": "tsc -p tsconfig.test.json && node --test .test-build/test/routing.test.js"
+   },
+   "devDependencies": {
+     "@cloudflare/workers-types": "^5.20260808.1",
++    "@types/node": "^20.19.43",
+     "typescript": "^5.3.0",
+     "wrangler": "^4.156.0"
+   }
+diff --git a/worker-relay/src/index.ts b/worker-relay/src/index.ts
+index 9e85e9f..d5c6935 100644
+--- a/worker-relay/src/index.ts
++++ b/worker-relay/src/index.ts
+@@ -1,9 +1,25 @@
+ /**
+  * Spotatui Listening Party relay worker.
+  * Routes WebSocket connections to Durable Object rooms by code.
++ *
++ * The relay is intentionally dumb: it routes and shapes JSON, and never stores
++ * the Party Queue. The host is the queue authority.
+  */
+ 
+ import { DurableObject } from "cloudflare:workers";
++import {
++  HOST_ID,
++  QUEUE_COMMAND_BURST,
++  QUEUE_COMMAND_REFILL_PER_SECOND,
++  TokenBucket,
++  classifyMessage,
++  handshakeFields,
++  parseMaxMessageBytes,
++  parseQueueEnabled,
++  utf8ByteLength,
++  withServerSender,
++  type PartyRole,
++} from "./routing";
+ 
+ const WS_PATH = "/ws";
+ const CODE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+@@ -11,7 +27,6 @@ const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+ const MAX_JOIN_ATTEMPTS = 10;
+ const MAX_CREATES = 10;
+ const CODE_LENGTH = 6;
+-const MAX_MESSAGE_SIZE = 4 * 1024;
+ const MAX_PARTICIPANTS = 8;
+ const INACTIVITY_MS = 5 * 60 * 1000;
+ 
+@@ -33,6 +48,10 @@ function normalizeDisplayName(value: string | null, fallback: string): string {
+ export interface Env {
+   PARTY_ROOM: DurableObjectNamespace;
+   RATE_LIMITER: DurableObjectNamespace<RateLimiter>;
++  /** UTF-8 bytes per frame; defaults to 4096. */
++  MAX_MESSAGE_BYTES?: string;
++  /** "0" turns off queue_* routing and the `queue` feature. */
++  QUEUE_ENABLED?: string;
+ }
+ 
+ interface RateWindow {
+@@ -66,6 +85,8 @@ interface Session {
+   isHost: boolean;
+   name: string;
+   ip: string;
++  /** Per-session budget for guest queue_command messages. */
++  queueCommands: TokenBucket;
+ }
+ 
+ export class PartyRoom extends DurableObject {
+@@ -75,9 +96,13 @@ export class PartyRoom extends DurableObject {
+   private hostName: string = "Host";
+   private roomControlMode: string = "host_only";
+   private ipConnections: Map<string, { hostCount: number; guestCount: number }> = new Map();
++  private maxMessageBytes: number;
++  private queueEnabled: boolean;
+ 
+   constructor(ctx: DurableObjectState, env: Env) {
+     super(ctx, env);
++    this.maxMessageBytes = parseMaxMessageBytes(env.MAX_MESSAGE_BYTES);
++    this.queueEnabled = parseQueueEnabled(env.QUEUE_ENABLED);
+   }
+ 
+   async fetch(request: Request): Promise<Response> {
+@@ -85,7 +110,10 @@ export class PartyRoom extends DurableObject {
+     const roomCode = url.searchParams.get("room_code") ?? "";
+     const isHost = url.searchParams.get("is_host") === "1";
+     const controlMode = url.searchParams.get("control_mode") ?? "host_only";
+-    const requestedName = normalizeDisplayName(url.searchParams.get("name"), "Guest");
++    const requestedName = normalizeDisplayName(
++      url.searchParams.get("name"),
++      isHost ? "Host" : "Guest",
++    );
+ 
+     if (!roomCode) {
+       return new Response("Missing room_code", { status: 400 });
+@@ -103,8 +131,13 @@ export class PartyRoom extends DurableObject {
+     const session: Session = {
+       id: sessionId,
+       isHost,
+-      name: isHost ? "Host" : this.guestName(requestedName),
++      name: isHost ? requestedName : this.guestName(requestedName),
+       ip: clientIp,
++      queueCommands: new TokenBucket(
++        QUEUE_COMMAND_BURST,
++        QUEUE_COMMAND_REFILL_PER_SECOND,
++        Date.now(),
++      ),
+     };
+ 
+     if (isHost && this.hostWs !== null && this.sessions.has(this.hostWs)) {
+@@ -143,6 +176,7 @@ export class PartyRoom extends DurableObject {
+       this.hostWs = server;
+       // Only the admitted host sets the mode; a rejected one must not change it.
+       this.roomControlMode = controlMode === "shared_control" ? "shared_control" : "host_only";
++      this.hostName = session.name;
+       this.scheduleInactivityAlarm();
+     } else {
+       ipEntry.guestCount++;
+@@ -156,24 +190,41 @@ export class PartyRoom extends DurableObject {
+       this.handleClose(server);
+     });
+ 
++    const handshake = handshakeFields(this.queueEnabled);
+     if (isHost) {
+       this.sendJson(server, {
+         type: "room_created",
+         code: roomCode,
+         control_mode: this.roomControlMode,
++        ...handshake,
++        you: this.you(session),
+       });
+     } else {
+       this.sendJson(server, {
+         type: "joined_room",
+         host_name: this.hostName,
+         control_mode: this.roomControlMode,
++        ...handshake,
++        you: this.you(session),
++      });
++      this.broadcastExcept(server, {
++        type: "guest_joined",
++        id: session.id,
++        name: session.name,
+       });
+-      this.broadcastExcept(server, { type: "guest_joined", name: session.name });
+     }
+ 
+     return new Response(null, { status: 101, webSocket: client });
+   }
+ 
++  private you(session: Session): { id: string; name: string; role: PartyRole } {
++    return {
++      id: session.isHost ? HOST_ID : session.id,
++      name: session.name,
++      role: session.isHost ? "host" : "guest",
++    };
++  }
++
+   // A guest may not pass for the host in the guest list.
+   private guestName(name: string, self?: Session): string {
+     const taken = [this.hostName, "Host"].some((n) => n.toLowerCase() === name.toLowerCase());
+@@ -188,10 +239,19 @@ export class PartyRoom extends DurableObject {
+     }
+   }
+ 
+-  private sendJson(ws: WebSocket, obj: object): void {
++  private encodeMessage(obj: object): string | null {
+     try {
+       const raw = JSON.stringify(obj);
+-      if (raw.length > MAX_MESSAGE_SIZE) return;
++      return utf8ByteLength(raw) <= this.maxMessageBytes ? raw : null;
++    } catch {
++      return null;
++    }
++  }
++
++  private sendJson(ws: WebSocket, obj: object): void {
++    const raw = this.encodeMessage(obj);
++    if (raw === null) return;
++    try {
+       ws.send(raw);
+     } catch {
+       // ignore
+@@ -203,61 +263,118 @@ export class PartyRoom extends DurableObject {
+     const session = this.sessions.get(ws);
+     if (!session) return;
+ 
+-    const raw = typeof data === "string" ? data : new TextDecoder().decode(data);
+-    if (raw.length > MAX_MESSAGE_SIZE) return;
++    const byteLength =
++      typeof data === "string" ? utf8ByteLength(data) : data.byteLength;
++    if (byteLength > this.maxMessageBytes) {
++      this.sendJson(ws, { type: "error", message: "Message too large" });
++      return;
++    }
+ 
+-    let msg: { type: string; [k: string]: unknown };
++    const raw = typeof data === "string" ? data : new TextDecoder().decode(data);
++    let parsed: unknown;
+     try {
+-      msg = JSON.parse(raw) as { type: string; [k: string]: unknown };
++      parsed = JSON.parse(raw);
+     } catch {
+       return;
+     }
++    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
++      return;
++    }
+ 
+-    switch (msg.type) {
+-      case "set_name": {
+-        let name = session.name;
+-        if (typeof msg.name === "string") {
+-          name = normalizeDisplayName(msg.name, session.isHost ? "Host" : "Guest");
+-          if (!session.isHost) name = this.guestName(name, session);
+-        }
+-        const prevName = session.name;
+-        session.name = name;
+-        if (!session.isHost && prevName !== session.name) {
+-          this.broadcastExcept(ws, { type: "guest_left", name: prevName });
+-          this.broadcastExcept(ws, { type: "guest_joined", name: session.name });
++    const msg = parsed as { type?: unknown; [key: string]: unknown };
++    if (typeof msg.type !== "string") return;
++
++    if (msg.type === "set_name") {
++      this.handleSetName(ws, session, msg);
++      return;
++    }
++
++    const role: PartyRole = session.isHost ? "host" : "guest";
++    const decision = classifyMessage(msg.type, role, this.queueEnabled, msg.to);
++
++    switch (decision.action) {
++      case "broadcast": {
++        if (decision.type === "set_control_mode") {
++          this.roomControlMode =
++            msg.control_mode === "shared_control" ? "shared_control" : "host_only";
++          this.broadcastAll({
++            type: "set_control_mode",
++            control_mode: this.roomControlMode,
++          });
++          break;
+         }
+-        if (session.isHost) this.hostName = session.name;
++        this.broadcastExcept(ws, msg);
+         break;
+       }
+-      case "set_control_mode": {
+-        if (!session.isHost) break;
+-        this.roomControlMode = msg.control_mode === "shared_control" ? "shared_control" : "host_only";
+-        this.broadcastAll({ type: "set_control_mode", control_mode: this.roomControlMode });
++      case "to_guest": {
++        const target = this.guestById(decision.to);
++        if (target) this.sendJson(target, { ...msg, to: decision.to });
+         break;
+       }
+-      case "sync_state": {
+-        if (session.isHost) {
+-          this.broadcastExcept(ws, msg);
++      case "to_host": {
++        if (
++          decision.type === "playback_command" &&
++          this.roomControlMode !== "shared_control"
++        ) {
++          break;
+         }
+-        break;
+-      }
+-      case "playback_command": {
+-        if (session.isHost) break;
+-        if (this.roomControlMode === "shared_control" && this.hostWs) {
+-          this.sendJson(this.hostWs, { ...msg, from: session.name });
++        if (
++          decision.type === "queue_command" &&
++          !session.queueCommands.tryTake(Date.now())
++        ) {
++          this.sendJson(ws, { type: "error", message: "Rate limited" });
++          break;
++        }
++        const host = this.hostWs;
++        if (host && this.sessions.has(host)) {
++          this.sendJson(host, withServerSender(msg, session));
+         }
+         break;
+       }
+-      case "heartbeat":
+-        break;
+-      default:
++      case "drop":
+         break;
+     }
+   }
+ 
++  private handleSetName(
++    ws: WebSocket,
++    session: Session,
++    msg: Record<string, unknown>,
++  ): void {
++    let name = session.name;
++    if (typeof msg.name === "string") {
++      name = normalizeDisplayName(msg.name, session.isHost ? "Host" : "Guest");
++      if (!session.isHost) name = this.guestName(name, session);
++    }
++    const prevName = session.name;
++    session.name = name;
++    if (!session.isHost && prevName !== session.name) {
++      this.broadcastExcept(ws, {
++        type: "guest_left",
++        id: session.id,
++        name: prevName,
++      });
++      this.broadcastExcept(ws, {
++        type: "guest_joined",
++        id: session.id,
++        name: session.name,
++      });
++    }
++    if (session.isHost) this.hostName = session.name;
++  }
++
++  private guestById(id: string): WebSocket | null {
++    for (const [ws, session] of this.sessions) {
++      if (!session.isHost && session.id === id && ws.readyState === WebSocket.OPEN) {
++        return ws;
++      }
++    }
++    return null;
++  }
++
+   private broadcastExcept(exclude: WebSocket, msg: object): void {
+-    const raw = JSON.stringify(msg);
+-    if (raw.length > MAX_MESSAGE_SIZE) return;
++    const raw = this.encodeMessage(msg);
++    if (raw === null) return;
+     this.sessions.forEach((_, ws) => {
+       if (ws !== exclude && ws.readyState === WebSocket.OPEN) {
+         ws.send(raw);
+@@ -292,7 +409,11 @@ export class PartyRoom extends DurableObject {
+       });
+       this.sessions.clear();
+     } else if (session) {
+-      this.broadcastExcept(ws, { type: "guest_left", name: session.name });
++      this.broadcastExcept(ws, {
++        type: "guest_left",
++        id: session.id,
++        name: session.name,
++      });
+     }
+     try {
+       ws.close(1000, "Closed");
+@@ -302,8 +423,8 @@ export class PartyRoom extends DurableObject {
+   }
+ 
+   private broadcastAll(msg: object): void {
+-    const raw = JSON.stringify(msg);
+-    if (raw.length > MAX_MESSAGE_SIZE) return;
++    const raw = this.encodeMessage(msg);
++    if (raw === null) return;
+     this.sessions.forEach((_, ws) => {
+       if (ws.readyState === WebSocket.OPEN) {
+         ws.send(raw);
+diff --git a/worker-relay/src/routing.ts b/worker-relay/src/routing.ts
+new file mode 100644
+index 0000000..3b5d0d3
+--- /dev/null
++++ b/worker-relay/src/routing.ts
+@@ -0,0 +1,225 @@
++/**
++ * Pure routing policy for the Spotatui party relay.
++ *
++ * Nothing in this module touches Cloudflare, WebSockets or timers, so the
++ * direction matrix, target handling and sender sanitizing can be tested with
++ * plain Node. `index.ts` owns the sockets and translates a decision into a
++ * send or a drop.
++ */
++
++export type PartyRole = "host" | "guest";
++
++export type DropReason =
++  | "unknown_type"
++  | "wrong_role"
++  | "queue_disabled"
++  | "invalid_target";
++
++export type RouteDecision =
++  | { action: "broadcast"; type: string }
++  | { action: "to_guest"; type: string; to: string }
++  | { action: "to_host"; type: string }
++  | { action: "drop"; type: string; reason: DropReason };
++
++export const HOST_ID = "host";
++export const DEFAULT_MAX_MESSAGE_BYTES = 4 * 1024;
++export const MIN_MAX_MESSAGE_BYTES = 512;
++export const MAX_MAX_MESSAGE_BYTES = 1024 * 1024;
++export const QUEUE_COMMAND_BURST = 10;
++export const QUEUE_COMMAND_REFILL_PER_SECOND = 2;
++
++// Host -> everyone. The relay is a dumb pipe for the queue itself.
++const HOST_BROADCAST_TYPES = new Set([
++  "party_config",
++  "party_members",
++  "queue_patch",
++  "set_control_mode",
++  "sync_state",
++  "heartbeat",
++]);
++
++// Host -> everyone, or host -> one guest when `to` names that guest.
++const HOST_DIRECTED_TYPES = new Set(["queue_snapshot", "queue_ack"]);
++
++// Guest -> host message types. `playback_command` additionally needs
++// shared_control, which the room enforces because it owns that state.
++const GUEST_TO_HOST_TYPES = new Set([
++  "queue_command",
++  "queue_resync",
++  "playback_command",
++]);
++
++/** Queue messages are the `queue_*` family; disabling them leaves v1 intact. */
++export function isQueueType(type: string): boolean {
++  return type.startsWith("queue_");
++}
++
++/**
++ * Decide where a client message goes.
++ *
++ * `to` is only consulted for the host-directed types. A non-string or empty
++ * target is invalid, while an absent/null target means broadcast. Resolving
++ * the target id to a live guest happens in `index.ts`, where the sessions
++ * live; an unknown id is dropped there.
++ */
++export function classifyMessage(
++  type: unknown,
++  role: PartyRole,
++  queueEnabled: boolean,
++  to?: unknown,
++): RouteDecision {
++  if (typeof type !== "string" || type.length === 0) {
++    return { action: "drop", type: "", reason: "unknown_type" };
++  }
++
++  if (!queueEnabled && isQueueType(type)) {
++    return { action: "drop", type, reason: "queue_disabled" };
++  }
++
++  if (HOST_BROADCAST_TYPES.has(type)) {
++    return role === "host"
++      ? { action: "broadcast", type }
++      : { action: "drop", type, reason: "wrong_role" };
++  }
++
++  if (HOST_DIRECTED_TYPES.has(type)) {
++    if (role !== "host") {
++      return { action: "drop", type, reason: "wrong_role" };
++    }
++    if (to === undefined || to === null) {
++      return { action: "broadcast", type };
++    }
++    if (typeof to !== "string") {
++      return { action: "drop", type, reason: "invalid_target" };
++    }
++    const target = normalizeParticipantId(to);
++    if (target === null) {
++      return { action: "drop", type, reason: "invalid_target" };
++    }
++    return { action: "to_guest", type, to: target };
++  }
++
++  if (GUEST_TO_HOST_TYPES.has(type)) {
++    return role === "guest"
++      ? { action: "to_host", type }
++      : { action: "drop", type, reason: "wrong_role" };
++  }
++
++  return {
++    action: "drop",
++    type,
++    reason: isQueueType(type) || type.startsWith("party_") ? "wrong_role" : "unknown_type",
++  };
++}
++
++/**
++ * Participant ids are relay-generated UUIDs, or the literal `host`. Keeping
++ * the accepted shape narrow stops a host from addressing arbitrary strings.
++ */
++export function normalizeParticipantId(value: string): string | null {
++  const id = value.trim();
++  if (id.length === 0 || id.length > 64) return null;
++  if (!/^[A-Za-z0-9._:-]+$/.test(id)) return null;
++  return id;
++}
++
++/** Copy a guest message with the relay's identity, discarding the client's. */
++export function withServerSender(
++  message: Record<string, unknown>,
++  sender: { id: string; name: string },
++): Record<string, unknown> {
++  const copy: Record<string, unknown> = { ...message };
++  delete copy.from;
++  delete copy.from_id;
++  copy.from = sender.name;
++  copy.from_id = sender.id;
++  return copy;
++}
++
++/** The `features` array advertised in the handshake. */
++export function featuresFor(queueEnabled: boolean): string[] {
++  return queueEnabled ? ["queue"] : [];
++}
++
++/** Handshake fields every v2 relay adds to `room_created` / `joined_room`. */
++export function handshakeFields(queueEnabled: boolean): {
++  protocol_version: 2;
++  features: string[];
++  playback_mode: "follow_host";
++  queue_revision: 0;
++} {
++  return {
++    protocol_version: 2,
++    features: featuresFor(queueEnabled),
++    playback_mode: "follow_host",
++    queue_revision: 0,
++  };
++}
++
++/** UTF-8 size, which is the protocol's size unit; JS `.length` is UTF-16. */
++const encoder = new TextEncoder();
++
++export function utf8ByteLength(text: string): number {
++  return encoder.encode(text).length;
++}
++
++/**
++ * `MAX_MESSAGE_BYTES` comes from `env`/`[vars]`. Invalid or out-of-range
++ * values fall back to the protocol default instead of failing requests.
++ */
++export function parseMaxMessageBytes(
++  value: string | undefined,
++  fallback: number = DEFAULT_MAX_MESSAGE_BYTES,
++): number {
++  if (value === undefined || value.trim() === "") return fallback;
++  const parsed = Number(value);
++  if (
++    !Number.isInteger(parsed) ||
++    parsed < MIN_MAX_MESSAGE_BYTES ||
++    parsed > MAX_MAX_MESSAGE_BYTES
++  ) {
++    return fallback;
++  }
++  return parsed;
++}
++
++/** `QUEUE_ENABLED=0` degrades the relay to a Listening Party relay. */
++export function parseQueueEnabled(value: string | undefined): boolean {
++  if (value === undefined) return true;
++  return !["0", "false", "off", "no", "disabled"].includes(value.trim().toLowerCase());
++}
++
++/**
++ * Per-session token bucket for `queue_command`. The room owns one per session;
++ * this class has no clock so tests can drive it deterministically.
++ */
++export class TokenBucket {
++  private tokens: number;
++  private lastRefillMs: number;
++
++  constructor(
++    private readonly burst: number = QUEUE_COMMAND_BURST,
++    private readonly refillPerSecond: number = QUEUE_COMMAND_REFILL_PER_SECOND,
++    nowMs: number = 0,
++  ) {
++    this.tokens = burst;
++    this.lastRefillMs = nowMs;
++  }
++
++  tryTake(nowMs: number): boolean {
++    const now = Math.max(nowMs, this.lastRefillMs);
++    const elapsedMs = now - this.lastRefillMs;
++    this.tokens = Math.min(
++      this.burst,
++      this.tokens + (elapsedMs * this.refillPerSecond) / 1000,
++    );
++    this.lastRefillMs = now;
++    if (this.tokens < 1) return false;
++    this.tokens -= 1;
++    return true;
++  }
++
++  get available(): number {
++    return this.tokens;
++  }
++}
+diff --git a/worker-relay/test/routing.test.ts b/worker-relay/test/routing.test.ts
+new file mode 100644
+index 0000000..1db2a9a
+--- /dev/null
++++ b/worker-relay/test/routing.test.ts
+@@ -0,0 +1,223 @@
++import { strict as assert } from "node:assert";
++import { test } from "node:test";
++
++import {
++  QUEUE_COMMAND_BURST,
++  TokenBucket,
++  classifyMessage,
++  featuresFor,
++  handshakeFields,
++  normalizeParticipantId,
++  parseMaxMessageBytes,
++  parseQueueEnabled,
++  utf8ByteLength,
++  withServerSender,
++} from "../src/routing.js";
++
++test("host broadcast types go to everyone", () => {
++  for (const type of [
++    "party_config",
++    "party_members",
++    "queue_patch",
++    "set_control_mode",
++    "sync_state",
++    "heartbeat",
++  ]) {
++    assert.deepEqual(classifyMessage(type, "host", true), { action: "broadcast", type });
++  }
++});
++
++test("host queue_snapshot and queue_ack broadcast without to", () => {
++  for (const type of ["queue_snapshot", "queue_ack"]) {
++    assert.deepEqual(classifyMessage(type, "host", true), { action: "broadcast", type });
++    assert.deepEqual(classifyMessage(type, "host", true, null), {
++      action: "broadcast",
++      type,
++    });
++  }
++});
++
++test("host queue_snapshot and queue_ack target one guest when to is set", () => {
++  assert.deepEqual(classifyMessage("queue_snapshot", "host", true, " p-7f3a "), {
++    action: "to_guest",
++    type: "queue_snapshot",
++    to: "p-7f3a",
++  });
++  assert.deepEqual(classifyMessage("queue_ack", "host", true, "p-7f3a"), {
++    action: "to_guest",
++    type: "queue_ack",
++    to: "p-7f3a",
++  });
++});
++
++test("a malformed to is dropped instead of broadcast", () => {
++  for (const to of ["", "   ", 42, {}, "bad id", "x".repeat(65)]) {
++    assert.deepEqual(classifyMessage("queue_snapshot", "host", true, to), {
++      action: "drop",
++      type: "queue_snapshot",
++      reason: "invalid_target",
++    });
++  }
++});
++
++test("guests send queue and playback messages only to the host", () => {
++  for (const type of ["queue_command", "queue_resync", "playback_command"]) {
++    assert.deepEqual(classifyMessage(type, "guest", true), { action: "to_host", type });
++  }
++});
++
++test("queue messages from the wrong role are dropped", () => {
++  for (const type of ["queue_patch", "queue_snapshot", "queue_ack", "party_config"]) {
++    assert.deepEqual(classifyMessage(type, "guest", true), {
++      action: "drop",
++      type,
++      reason: "wrong_role",
++    });
++  }
++  for (const type of ["queue_command", "queue_resync", "playback_command"]) {
++    assert.deepEqual(classifyMessage(type, "host", true), {
++      action: "drop",
++      type,
++      reason: "wrong_role",
++    });
++  }
++});
++
++test("QUEUE_ENABLED=0 removes queue_* but keeps Listening Party v1", () => {
++  for (const type of ["queue_patch", "queue_snapshot", "queue_command", "queue_resync"]) {
++    const role = type === "queue_command" || type === "queue_resync" ? "guest" : "host";
++    assert.deepEqual(classifyMessage(type, role, false), {
++      action: "drop",
++      type,
++      reason: "queue_disabled",
++    });
++  }
++  assert.deepEqual(classifyMessage("sync_state", "host", false), {
++    action: "broadcast",
++    type: "sync_state",
++  });
++  assert.deepEqual(classifyMessage("playback_command", "guest", false), {
++    action: "to_host",
++    type: "playback_command",
++  });
++});
++
++test("unknown client messages are dropped without closing anything", () => {
++  assert.deepEqual(classifyMessage("error", "host", true), {
++    action: "drop",
++    type: "error",
++    reason: "unknown_type",
++  });
++  assert.deepEqual(classifyMessage("guest_joined", "guest", true), {
++    action: "drop",
++    type: "guest_joined",
++    reason: "unknown_type",
++  });
++  assert.deepEqual(classifyMessage(undefined, "guest", true), {
++    action: "drop",
++    type: "",
++    reason: "unknown_type",
++  });
++});
++
++test("withServerSender discards the client's from/from_id", () => {
++  const incoming = {
++    type: "queue_command",
++    op_id: "a1",
++    from: "mallory",
++    from_id: "p-evil",
++  };
++  const outgoing = withServerSender(incoming, { id: "p-7f3a", name: "ana" });
++  assert.equal(outgoing.type, "queue_command");
++  assert.equal(outgoing.op_id, "a1");
++  assert.equal(outgoing.from, "ana");
++  assert.equal(outgoing.from_id, "p-7f3a");
++  assert.equal(incoming.from, "mallory");
++  assert.equal(incoming.from_id, "p-evil");
++});
++
++test("withServerSender also stamps queue_resync", () => {
++  const outgoing = withServerSender(
++    { type: "queue_resync", have_revision: 40 },
++    { id: "p-7f3a", name: "ana" },
++  );
++  assert.equal(outgoing.from, "ana");
++  assert.equal(outgoing.from_id, "p-7f3a");
++});
++
++test("token bucket allows a burst of ten and refills at two per second", () => {
++  const bucket = new TokenBucket(QUEUE_COMMAND_BURST, 2, 0);
++  for (let i = 0; i < QUEUE_COMMAND_BURST; i++) {
++    assert.equal(bucket.tryTake(0), true, `burst take ${i}`);
++  }
++  assert.equal(bucket.tryTake(0), false);
++  assert.equal(bucket.tryTake(499), false);
++  assert.equal(bucket.tryTake(500), true);
++  assert.equal(bucket.tryTake(500), false);
++  assert.equal(bucket.tryTake(1000), true);
++  assert.equal(bucket.tryTake(1000), false);
++});
++
++test("token bucket never refills past the burst", () => {
++  const bucket = new TokenBucket(10, 2, 0);
++  for (let i = 0; i < 10; i++) assert.equal(bucket.tryTake(0), true);
++  assert.equal(bucket.available, 0);
++  assert.equal(bucket.tryTake(60_000), true);
++  assert.equal(bucket.available, 9);
++});
++
++test("participant ids are trimmed and kept to the relay's shape", () => {
++  assert.equal(normalizeParticipantId(" host "), "host");
++  assert.equal(
++    normalizeParticipantId("7f3a2c9e-1b4d-4e8a-9c0f-123456789abc"),
++    "7f3a2c9e-1b4d-4e8a-9c0f-123456789abc",
++  );
++  assert.equal(normalizeParticipantId(""), null);
++  assert.equal(normalizeParticipantId("bad id"), null);
++  assert.equal(normalizeParticipantId("x".repeat(65)), null);
++  assert.equal(normalizeParticipantId("bad\u0000id"), null);
++});
++
++test("MAX_MESSAGE_BYTES parses env values and falls back safely", () => {
++  assert.equal(parseMaxMessageBytes(undefined), 4096);
++  assert.equal(parseMaxMessageBytes(""), 4096);
++  assert.equal(parseMaxMessageBytes("8192"), 8192);
++  assert.equal(parseMaxMessageBytes("512"), 512);
++  for (const invalid of ["abc", "0", "1.5", "-1", "999999999"]) {
++    assert.equal(parseMaxMessageBytes(invalid), 4096, invalid);
++  }
++});
++
++test("QUEUE_ENABLED parses off values", () => {
++  assert.equal(parseQueueEnabled(undefined), true);
++  assert.equal(parseQueueEnabled("1"), true);
++  assert.equal(parseQueueEnabled("true"), true);
++  for (const off of ["0", "false", "FALSE", "off", "no", "disabled"]) {
++    assert.equal(parseQueueEnabled(off), false, off);
++  }
++});
++
++test("handshake advertises protocol v2 and the queue feature", () => {
++  assert.deepEqual(featuresFor(true), ["queue"]);
++  assert.deepEqual(featuresFor(false), []);
++  assert.deepEqual(handshakeFields(true), {
++    protocol_version: 2,
++    features: ["queue"],
++    playback_mode: "follow_host",
++    queue_revision: 0,
++  });
++  assert.deepEqual(handshakeFields(false), {
++    protocol_version: 2,
++    features: [],
++    playback_mode: "follow_host",
++    queue_revision: 0,
++  });
++});
++
++test("size is measured in UTF-8 bytes, not UTF-16 code units", () => {
++  assert.equal(utf8ByteLength("abc"), 3);
++  assert.equal(utf8ByteLength("é"), 2);
++  assert.equal(utf8ByteLength("漢"), 3);
++  assert.equal(utf8ByteLength("🎵"), 4);
++  assert.equal("🎵".length, 2);
++});
+diff --git a/worker-relay/tsconfig.test.json b/worker-relay/tsconfig.test.json
+new file mode 100644
+index 0000000..2194ac2
+--- /dev/null
++++ b/worker-relay/tsconfig.test.json
+@@ -0,0 +1,12 @@
++{
++  "extends": "./tsconfig.json",
++  "compilerOptions": {
++    "noEmit": false,
++    "outDir": ".test-build",
++    "rootDir": ".",
++    "module": "NodeNext",
++    "moduleResolution": "NodeNext",
++    "types": ["node"]
++  },
++  "include": ["src/routing.ts", "test/**/*.ts"]
++}
+diff --git a/worker-relay/wrangler.toml b/worker-relay/wrangler.toml
+index 552f75a..d250aca 100644
+--- a/worker-relay/wrangler.toml
++++ b/worker-relay/wrangler.toml
+@@ -2,6 +2,12 @@ name = "spotatui-party"
+ main = "src/index.ts"
+ compatibility_date = "2024-12-01"
+ 
++[vars]
++# UTF-8 bytes per WebSocket frame. The protocol default is 4096.
++MAX_MESSAGE_BYTES = "4096"
++# Set to "0" to deploy a Listening Party-only relay (queue_* is discarded).
++QUEUE_ENABLED = "1"
++
+ [[durable_objects.bindings]]
+ name = "PARTY_ROOM"
+ class_name = "PartyRoom"
+@@ -17,3 +23,30 @@ new_sqlite_classes = ["PartyRoom"]
+ [[migrations]]
+ tag = "v2"
+ new_sqlite_classes = ["RateLimiter"]
++
++# Staging is a separate Worker with its own Durable Object namespaces.
++# Deploy with: npm run deploy:staging
++[env.staging]
++name = "spotatui-party-staging"
++main = "src/index.ts"
++compatibility_date = "2024-12-01"
++
++[env.staging.vars]
++MAX_MESSAGE_BYTES = "4096"
++QUEUE_ENABLED = "1"
++
++[[env.staging.durable_objects.bindings]]
++name = "PARTY_ROOM"
++class_name = "PartyRoom"
++
++[[env.staging.durable_objects.bindings]]
++name = "RATE_LIMITER"
++class_name = "RateLimiter"
++
++[[env.staging.migrations]]
++tag = "v1"
++new_sqlite_classes = ["PartyRoom"]
++
++[[env.staging.migrations]]
++tag = "v2"
++new_sqlite_classes = ["RateLimiter"]
+-- 
+2.47.3
+

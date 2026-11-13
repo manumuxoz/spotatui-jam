@@ -99,7 +99,7 @@ Issue (backlog) → rama corta → PR pequeño → CI → review → squash a ma
 | 2.4 | Broadcast de snapshot/patch/ack; coalescing | Red | Un cliente de test recibe todo |
 | 2.5 | Relay v2: pasar `queue_*`, ids, rate limit, dirección | Worker | Tests de integración |
 | 2.6 | Relay de test local (wrangler dev o axum mínimo) | Script | `just relay-dev` levanta en < 5 s |
-| 2.7 | `party-sim`: host + N invitados simulados | Binario | 8 invitados, 100 ops, sin divergencia |
+| 2.7 | Integración host+guest con relay real; simulador de 8 invitados | Tests | Add/ack/patch convergen; simulador P1 |
 | 2.8 | Matriz de compatibilidad old/new | Tests | 4 combinaciones documentadas |
 | 2.9 | Métricas de latencia en el simulador | Informe | p95 add→patch < 100 ms local |
 

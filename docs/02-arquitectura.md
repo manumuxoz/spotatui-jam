@@ -76,7 +76,7 @@ Línea base auditada: commit `4c5fc99` (2026-11-10), versión 0.48.0, 353 archiv
 | `party::protocol` | Tipos de mensajes v2, serialización, validación, chunking | `src/infra/network/party_protocol.rs` |
 | `party::relay` | Cliente WebSocket v2; compatibilidad con relay v1 | `src/infra/network/sync.rs` (extender) |
 | `PartyView` | Pantalla completa de cola/miembros/ajustes | `src/tui/ui/party.rs` (nuevo) |
-| `party-sim` | Simulador host/N invitados sin audio para tests y soak | `src/bin/party_sim.rs` o `tests/party_sim` |
+| `party-sim` | Simulador host/N invitados sin audio para soak (P1) | `tests/party_sim` o crate aparte |
 | `jam-relay` (P1) | Relay Rust auto-hospedable, mismo protocolo | `relay/` (nuevo crate del workspace) |
 
 No se crea un daemon separado para la v1. Un daemon añade un proceso, un socket local, autenticación y empaquetado; no resuelve nada que el fork no resuelva mejor, y rompe la experiencia “todo en la TUI”.
