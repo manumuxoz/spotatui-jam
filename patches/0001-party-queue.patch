@@ -1,4 +1,4 @@
-From 4bb9ee2496de2e0cac8a024a308c00014b4797aa Mon Sep 17 00:00:00 2001
+From ddcc385583e93e46bea889cc8563736c6df7d5c0 Mon Sep 17 00:00:00 2001
 From: manumuxoz <manuel.munhozvazquez@gmail.com>
 Date: Fri, 13 Nov 2026 17:16:21 +0100
 Subject: [PATCH] feat(party): add host-authoritative collaborative queue
@@ -28,15 +28,15 @@ Subject: [PATCH] feat(party): add host-authoritative collaborative queue
  src/tui/handlers/queue_menu.rs    |   16 +-
  src/tui/ui/popups.rs              |  239 +++++-
  worker-relay/.gitignore           |    3 +
- worker-relay/README.md            |  145 ++++
+ worker-relay/README.md            |  149 ++++
  worker-relay/package-lock.json    |   64 +-
  worker-relay/package.json         |    7 +-
- worker-relay/src/index.ts         |  209 ++++-
+ worker-relay/src/index.ts         |  212 ++++-
  worker-relay/src/routing.ts       |  225 +++++
  worker-relay/test/routing.test.ts |  223 +++++
  worker-relay/tsconfig.test.json   |   12 +
  worker-relay/wrangler.toml        |   33 +
- 27 files changed, 3741 insertions(+), 147 deletions(-)
+ 27 files changed, 3748 insertions(+), 147 deletions(-)
  create mode 100644 src/core/party/mod.rs
  create mode 100644 src/core/party/queue.rs
  create mode 100644 worker-relay/.gitignore
@@ -3683,10 +3683,10 @@ index 0000000..1c94436
 +node_modules/
 diff --git a/worker-relay/README.md b/worker-relay/README.md
 new file mode 100644
-index 0000000..0998fa6
+index 0000000..a378c98
 --- /dev/null
 +++ b/worker-relay/README.md
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,149 @@
 +# Spotatui party relay
 +
 +Cloudflare Worker that relays the Spotatui Listening Party. Connections are
@@ -3710,6 +3710,10 @@ index 0000000..0998fa6
 +on create (default `Host`) and required on join. A v2 client adds
 +`v=2&features=queue`, but the relay does not require those parameters: a v1
 +client keeps working unchanged.
++
++## Healthcheck
++
++`GET /healthz` returns `{"ok":true}`. It is used by the CI and deployment smoke tests.
 +
 +## Protocol v2
 +
@@ -4057,7 +4061,7 @@ index c30abf1..16bfaea 100644
      "wrangler": "^4.156.0"
    }
 diff --git a/worker-relay/src/index.ts b/worker-relay/src/index.ts
-index 9e85e9f..d5c6935 100644
+index 9e85e9f..45ee36b 100644
 --- a/worker-relay/src/index.ts
 +++ b/worker-relay/src/index.ts
 @@ -1,9 +1,25 @@
@@ -4406,6 +4410,16 @@ index 9e85e9f..d5c6935 100644
      this.sessions.forEach((_, ws) => {
        if (ws.readyState === WebSocket.OPEN) {
          ws.send(raw);
+@@ -332,6 +453,9 @@ export class PartyRoom extends DurableObject {
+ export default {
+   async fetch(request: Request, env: Env): Promise<Response> {
+     const url = new URL(request.url);
++    if (url.pathname === "/healthz") {
++      return Response.json({ ok: true });
++    }
+     if (!url.pathname.endsWith(WS_PATH)) {
+       return new Response("Not Found", { status: 404 });
+     }
 diff --git a/worker-relay/src/routing.ts b/worker-relay/src/routing.ts
 new file mode 100644
 index 0000000..3b5d0d3

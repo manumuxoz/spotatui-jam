@@ -178,13 +178,14 @@ async function main() {
   if (command.action?.op !== "add") throw new Error("acción inesperada");
   console.log(`comando recibido de ${command.from}`);
 
+  const senderId = command.from_id ?? command.from;
   const item = {
     id: 1,
     uri: command.action.uri,
     title: command.action.title,
     artists: command.action.artists,
     duration_ms: command.action.duration_ms,
-    added_by: command.from,
+    added_by: senderId,
     added_by_name: "smoke-guest",
     votes: 0,
     added_at_ms: Date.now(),
@@ -195,7 +196,7 @@ async function main() {
     op_id: opId,
     ok: true,
     revision: 1,
-    to: command.from,
+    to: senderId,
   });
   host.send({
     type: "queue_patch",

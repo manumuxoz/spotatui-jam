@@ -1,7 +1,7 @@
 # 10 — Estado de implementación
 
 **Fecha:** 13 de noviembre de 2026.
-**Base:** spotatui `v0.48.0` (`3174b77`), fork en `work/spotatui`, rama `feat/party-queue`, commit `4bb9ee2`.
+**Base:** spotatui `v0.48.0` (`3174b77`), fork en `work/spotatui`, rama `feat/party-queue`, commit `ddcc385`.
 **Parche exportado:** [`patches/0001-party-queue.patch`](../patches/0001-party-queue.patch).
 
 ---
@@ -53,7 +53,7 @@
 - **Cloudflare Worker:** `work/spotatui/worker-relay/`.
   - Handshake v2, routing puro en `src/routing.ts`, tests Node, `wrangler.toml` con staging/producción, `MAX_MESSAGE_BYTES` y `QUEUE_ENABLED`.
   - 17 tests de routing; `tsc --noEmit`, bundle y TOML validados.
-  - No se desplegó (falta cuenta/credenciales y Node 22 para wrangler).
+  - Se validó con `wrangler deploy --dry-run` y `wrangler dev` (Node 22); no se desplegó a una cuenta real.
 
 ### Pruebas ejecutadas
 
@@ -66,9 +66,10 @@
 | `npx tsc --noEmit` (worker) | OK |
 | `cargo fmt --check` (spotatui y relay) | OK |
 | `cargo clippy ... -D warnings` (slim+streaming) | OK |
-| `scripts/smoke-party.mjs` contra relay Rust | `add -> ack -> patch` OK |
+| `scripts/smoke-party.mjs` contra relay Rust y Worker | `add -> ack -> patch` OK en ambos |
+| `wrangler deploy --dry-run --env staging` (Node 22) | OK; bundle 17,5 KiB |
 | `relay_roundtrip_carries_a_queue_command_from_a_guest` (`--ignored`) | OK contra relay real |
-| `two_apps_exchange_a_queue_add_through_the_real_relay` (`--ignored`) | OK: host + guest + relay real |
+| `two_apps_exchange_a_queue_add_through_the_real_relay` (`--ignored`) | OK contra Rust y contra Worker |
 
 Los tests ignorados requieren `PARTY_RELAY_URL=ws://127.0.0.1:8080/ws` y el relay arrancado:
 
