@@ -93,7 +93,7 @@ jobs:
       - name: Unit + property + golden tests
         run: "cargo test --locked party:: -- --nocapture"
       - name: Snapshot chunk size
-        run: "cargo test --locked party::queue::tests::queue_snapshot_is_chunked_below_the_relay_limit -- --exact"
+        run: "cargo test --locked queue_snapshot_is_chunked_below_the_relay_limit -- --exact"
   party-integration:
     name: Host + guest through a real relay
     runs-on: ubuntu-latest
@@ -117,7 +117,9 @@ jobs:
           PARTY_RELAY_URL: ws://127.0.0.1:8787/ws
         run: |
           cargo test --locked --no-default-features --features telemetry,tui,streaming \
-            -- --ignored --nocapture
+            two_apps_exchange -- --ignored --nocapture
+          cargo test --locked --no-default-features --features telemetry,tui,streaming \
+            relay_roundtrip -- --ignored --nocapture
 
   relay:
     name: Relay (Worker)
