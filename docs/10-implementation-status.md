@@ -1,7 +1,7 @@
 # 10 — Estado de implementación
 
 **Fecha:** 13 de noviembre de 2026.
-**Base:** spotatui `v0.48.0` (`3174b77`), fork en `work/spotatui`, rama `feat/party-queue`, commit `ddcc385`.
+**Base:** spotatui `v0.48.0` (`3174b77`), fork en `work/spotatui`, rama `feat/party-queue`, commit `18a7ffb`.
 **Parche exportado:** [`patches/0001-party-queue.patch`](../patches/0001-party-queue.patch).
 
 ---

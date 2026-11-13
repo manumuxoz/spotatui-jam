@@ -2,7 +2,7 @@
 
 Extensión de [spotatui](https://github.com/LargeModGames/spotatui) para convertir su **Listening Party** en una jam real: reproducción sincronizada **y una cola compartida** que todos los participantes pueden ver y modificar.
 
-> **Estado:** MVP implementado y probado sobre spotatui 0.48.0. El fork vive en `work/spotatui` (rama `feat/party-queue`, commit `ddcc385`) y el parche exportado está en [`patches/0001-party-queue.patch`](patches/0001-party-queue.patch). Incluye cola autoritativa, protocolo v2, relay Rust y Worker, UI TUI y tests. Ver [`docs/10-implementation-status.md`](docs/10-implementation-status.md).
+> **Estado:** MVP implementado y probado sobre spotatui 0.48.0. El fork vive en `work/spotatui` (rama `feat/party-queue`, commit `18a7ffb`) y el parche exportado está en [`patches/0001-party-queue.patch`](patches/0001-party-queue.patch). Incluye cola autoritativa, protocolo v2, relay Rust y Worker, UI TUI y tests. Ver [`docs/10-implementation-status.md`](docs/10-implementation-status.md).
 
 ---
 

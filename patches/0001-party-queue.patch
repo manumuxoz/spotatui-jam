@@ -1,4 +1,4 @@
-From ddcc385583e93e46bea889cc8563736c6df7d5c0 Mon Sep 17 00:00:00 2001
+From 18a7ffb01ad850e07a10bba681e0ed2eb462f058 Mon Sep 17 00:00:00 2001
 From: manumuxoz <manuel.munhozvazquez@gmail.com>
 Date: Fri, 13 Nov 2026 17:16:21 +0100
 Subject: [PATCH] feat(party): add host-authoritative collaborative queue
@@ -22,7 +22,7 @@ Subject: [PATCH] feat(party): add host-authoritative collaborative queue
  src/core/party/queue.rs           | 1323 +++++++++++++++++++++++++++++
  src/gui/protocol.rs               |    5 +
  src/infra/network/library.rs      |    6 +-
- src/infra/network/mod.rs          |  749 +++++++++++++++-
+ src/infra/network/mod.rs          |  763 ++++++++++++++++-
  src/infra/network/sync.rs         |  330 +++++++
  src/tui/handlers/party.rs         |   36 +-
  src/tui/handlers/queue_menu.rs    |   16 +-
@@ -36,7 +36,7 @@ Subject: [PATCH] feat(party): add host-authoritative collaborative queue
  worker-relay/test/routing.test.ts |  223 +++++
  worker-relay/tsconfig.test.json   |   12 +
  worker-relay/wrangler.toml        |   33 +
- 27 files changed, 3748 insertions(+), 147 deletions(-)
+ 27 files changed, 3762 insertions(+), 147 deletions(-)
  create mode 100644 src/core/party/mod.rs
  create mode 100644 src/core/party/queue.rs
  create mode 100644 worker-relay/.gitignore
@@ -1879,7 +1879,7 @@ index eed62d3..c92594c 100644
        selected.owner_username(),
        selected.length().max(0) as u32,
 diff --git a/src/infra/network/mod.rs b/src/infra/network/mod.rs
-index ce29d65..b20a35b 100644
+index ce29d65..ce854d5 100644
 --- a/src/infra/network/mod.rs
 +++ b/src/infra/network/mod.rs
 @@ -18,6 +18,7 @@ pub mod utils;
@@ -2055,7 +2055,7 @@ index ce29d65..b20a35b 100644
      let sync_state = {
        let app = self.app.lock().await;
        let session = match app.party_session() {
-@@ -1714,14 +1779,271 @@ impl Network {
+@@ -1714,11 +1779,268 @@ impl Network {
    }
  
    async fn party_playback_command(&mut self, action: sync::PlaybackAction) {
@@ -2074,10 +2074,10 @@ index ce29d65..b20a35b 100644
 -        log::error!("Failed to send playback command: {}", e);
 +      if let Err(e) = conn.send(msg).await {
 +        log::error!("Failed to send party message: {}", e);
-       }
-     }
-   }
- 
++      }
++    }
++  }
++
 +  /// Apply a host intent and broadcast the resulting patch, or forward a
 +  /// guest intent to the host through the relay.
 +  async fn party_queue_command(&mut self, action: QueueAction) {
@@ -2143,7 +2143,7 @@ index ce29d65..b20a35b 100644
 +        self
 +          .send_party_message(&sync::SyncMessage::QueuePatch(patch))
 +          .await;
-+      }
+       }
 +      if let Some(uri) = play_now_uri {
 +        let mut app = self.app.lock().await;
 +        app.start_playback_uris(vec![uri], None);
@@ -2324,13 +2324,10 @@ index ce29d65..b20a35b 100644
 +    if let Some(uri) = play_now_uri {
 +      let mut app = self.app.lock().await;
 +      app.start_playback_uris(vec![uri], None);
-+    }
-+  }
-+
-   pub async fn process_party_messages(&mut self) {
-     // Every relay handler below drives the Spotify client; without a session
-     // there is nothing to sync and `spotify()` would panic the pump. Close the
-@@ -1761,43 +2083,158 @@ impl Network {
+     }
+   }
+ 
+@@ -1761,43 +2083,172 @@ impl Network {
      let mut latest_state = None;
      for msg in messages {
        match msg {
@@ -2439,6 +2436,13 @@ index ce29d65..b20a35b 100644
 +          }
 +        }
 +        sync::SyncMessage::QueueSnapshot(snapshot) => {
++          let is_host = {
++            let app = self.app.lock().await;
++            app.party_is_host()
++          };
++          if is_host {
++            continue;
++          }
 +          let full = self.party_snapshot_assembler.push(&snapshot);
 +          if let Some(full) = full {
 +            let mut app = self.app.lock().await;
@@ -2450,6 +2454,13 @@ index ce29d65..b20a35b 100644
 +          }
 +        }
 +        sync::SyncMessage::QueuePatch(patch) => {
++          let is_host = {
++            let app = self.app.lock().await;
++            app.party_is_host()
++          };
++          if is_host {
++            continue;
++          }
 +          let resync = {
 +            let mut app = self.app.lock().await;
 +            match app.party_queue_mut().apply_patch(&patch) {
@@ -2498,7 +2509,7 @@ index ce29d65..b20a35b 100644
          }
          sync::SyncMessage::SetControlMode { control_mode } => {
            let mut app = self.app.lock().await;
-@@ -1813,25 +2250,40 @@ impl Network {
+@@ -1813,25 +2264,40 @@ impl Network {
          }
          sync::SyncMessage::RoomClosed => {
            self.party_connection = None;
@@ -2551,7 +2562,7 @@ index ce29d65..b20a35b 100644
          }
          _ => {}
        }
-@@ -1969,6 +2421,12 @@ impl Network {
+@@ -1969,6 +2435,12 @@ impl Network {
    }
  }
  
@@ -2564,7 +2575,7 @@ index ce29d65..b20a35b 100644
  /// Keep diagnostics and the CLI byte-identical while giving the UI a localized context.
  fn report_request_error(app: &mut App, error: anyhow::Error) {
    let message = app
-@@ -1982,6 +2440,106 @@ fn report_request_error(app: &mut App, error: anyhow::Error) {
+@@ -1982,6 +2454,106 @@ fn report_request_error(app: &mut App, error: anyhow::Error) {
  #[cfg(test)]
  mod tests {
  
@@ -2671,7 +2682,7 @@ index ce29d65..b20a35b 100644
    #[tokio::test]
    async fn speaker_errors_use_the_active_ui_language_without_losing_the_error_route() {
      use crate::core::i18n::{Language, LocalizedMessage};
-@@ -2638,9 +3196,14 @@ mod tests {
+@@ -2638,9 +3210,14 @@ mod tests {
        role,
        code: "ABC123".to_string(),
        guests: Vec::new(),
@@ -2686,7 +2697,7 @@ index ce29d65..b20a35b 100644
      }
    }
  
-@@ -2654,10 +3217,15 @@ mod tests {
+@@ -2654,10 +3231,15 @@ mod tests {
    async fn party_network(app: &Arc<Mutex<App>>, role: sync::PartyRole) -> Network {
      let mut network = session_free_network(app);
      network.spotify = Some(SpotifyLogin::new());
@@ -2706,7 +2717,7 @@ index ce29d65..b20a35b 100644
      network
    }
  
-@@ -2683,7 +3251,119 @@ mod tests {
+@@ -2683,9 +3265,121 @@ mod tests {
      sync::SyncMessage::PlaybackCommand {
        action: sync::PlaybackAction::Pause,
        from: None,
@@ -2725,9 +2736,9 @@ index ce29d65..b20a35b 100644
 +      added_by_name: "ana".to_string(),
 +      votes: 0,
 +      added_at_ms: sync::now_ms(),
-+    }
-+  }
-+
+     }
+   }
+ 
 +  #[tokio::test]
 +  async fn a_host_applies_a_guest_queue_command() {
 +    let (app, _rx) = app_with_a_session();
@@ -2800,7 +2811,7 @@ index ce29d65..b20a35b 100644
 +        }),
 +      )
 +      .await;
-     }
++    }
 +    let app = app.lock().await;
 +    assert_eq!(app.party_queue().revision, 3);
 +    assert_eq!(app.party_queue().items.len(), 1);
@@ -2823,10 +2834,12 @@ index ce29d65..b20a35b 100644
 +    let app = app.lock().await;
 +    let session = app.party_session().unwrap();
 +    assert!(session.members.iter().any(|member| member.id == "p-9"));
-   }
- 
++  }
++
    #[tokio::test]
-@@ -2768,6 +3448,7 @@ mod tests {
+   async fn a_guest_follows_the_host_through_a_dispatched_start() {
+     let (app, rx) = app_with_a_session();
+@@ -2768,6 +3462,7 @@ mod tests {
            position_ms: u64::MAX,
          },
          from: None,
@@ -2834,7 +2847,7 @@ index ce29d65..b20a35b 100644
        },
      )
      .await;
-@@ -2824,20 +3505,23 @@ mod tests {
+@@ -2824,20 +3519,23 @@ mod tests {
  
    #[cfg(feature = "streaming")]
    #[tokio::test]
@@ -2860,7 +2873,7 @@ index ce29d65..b20a35b 100644
    }
  
    #[tokio::test]
-@@ -2854,6 +3538,7 @@ mod tests {
+@@ -2854,6 +3552,7 @@ mod tests {
      relay(
        &mut network,
        sync::SyncMessage::GuestJoined {
@@ -3379,7 +3392,7 @@ index 380ebd0..862bdb0 100644
      return;
    };
 diff --git a/src/tui/ui/popups.rs b/src/tui/ui/popups.rs
-index 1416b4a..afc44e3 100644
+index 1416b4a..f2df389 100644
 --- a/src/tui/ui/popups.rs
 +++ b/src/tui/ui/popups.rs
 @@ -500,16 +500,25 @@ pub fn draw_queue_in(f: &mut Frame<'_>, app: &App, area: Rect) {
@@ -3472,7 +3485,7 @@ index 1416b4a..afc44e3 100644
 +    app
 +      .strings()
 +      .popups
-+      .party_queue_title(queue.revision, queue.items.len()),
++      .party_queue_title(queue.revision, queue.len()),
 +    hint_style,
 +  )));
 +  if let Some(current) = &queue.current {
