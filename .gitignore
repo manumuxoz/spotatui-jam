@@ -23,3 +23,6 @@ Thumbs.db
 # Working fork (not committed)
 /work/spotatui/
 /work/
+
+# Bootstrap checkout
+/vendor/

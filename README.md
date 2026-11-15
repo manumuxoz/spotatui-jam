@@ -2,7 +2,7 @@
 
 Extensión de [spotatui](https://github.com/LargeModGames/spotatui) para convertir su **Listening Party** en una jam real usando **YouTube**: reproducción sincronizada y una **cola compartida** que todos los participantes pueden ver y modificar.
 
-> **Estado:** MVP implementado y probado sobre spotatui 0.48.0. El fork vive en `work/spotatui` (rama `feat/party-queue`, commit `e5be778`) y el parche exportado está en [`patches/0001-party-queue.patch`](patches/0001-party-queue.patch). La cola es **YouTube-only**; el transporte Spotify de Listening Party se mantiene por compatibilidad, pero no se usa para la cola. Ver [`docs/10-implementation-status.md`](docs/10-implementation-status.md).
+> **Estado:** MVP implementado y probado sobre spotatui 0.48.0. El fork de desarrollo vive en `work/spotatui` (no versionado; rama `feat/party-queue`, commit `e5be778`) y el repositorio publica el parche reproducible [`patches/0001-party-queue.patch`](patches/0001-party-queue.patch). La cola es **YouTube-only**; el transporte Spotify de Listening Party se mantiene por compatibilidad, pero no se usa para la cola. Ver [`docs/10-implementation-status.md`](docs/10-implementation-status.md).
 
 ---
 

@@ -73,6 +73,7 @@
 | `scripts/smoke-youtube.sh` (yt-dlp real) | OK: `youtube:dQw4w9WgXcQ`, título y 213 s |
 | Descarga de 5 s con `yt-dlp` + `ffprobe` | OK: m4a de 81 KiB, 5,015 s |
 | `wrangler deploy --dry-run --env staging` (Node 22) | OK; bundle 17,5 KiB |
+| `./scripts/bootstrap.sh /tmp/...` | OK: clona v0.48.0, aplica el parche y compila |
 | `relay_roundtrip_carries_a_queue_command_from_a_guest` (`--ignored`) | OK contra relay real |
 | `two_apps_exchange_a_queue_add_through_the_real_relay` (`--ignored`) | OK contra Rust y contra Worker |
 
