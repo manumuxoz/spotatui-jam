@@ -56,7 +56,7 @@ La investigación original, con fuentes y fechas, está en [`research/00-sintesi
 6. **Spotify:** el transporte Spotify de Listening Party se conserva para clientes v1, pero la Party Queue no acepta `spotify:track:`.
 7. **Upstream-first:** PR pequeño y revisable contra spotatui; si no se acepta, fork mantenido con rebase. La licencia MIT lo permite.
 
-Detalle y alternativas en [`docs/02-arquitectura.md`](docs/02-arquitectura.md) y [`docs/07-adr/`](docs/07-adr/).
+Detalle y alternativas en [`docs/02-arquitectura.md`](docs/02-arquitectura.md) y [`docs/07-adr/`](docs/07-adr/). Cambios por versión en [`CHANGELOG.md`](CHANGELOG.md); flujo de contribución en [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ---
 
