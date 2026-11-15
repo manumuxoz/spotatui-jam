@@ -15,7 +15,7 @@ Lo que no existe es la segunda. La cola del host sigue siendo privada: los invit
 
 > **Listening Party sincroniza el oído. spotatui-jam sincroniza la decisión.**
 
-Una extensión de spotatui que añade una cola colaborativa en tiempo real a Listening Party, con el host como árbitro y la terminal como interfaz. Sin apps web, sin cuentas extra, sin depender de la Jam cerrada de Spotify.
+Una extensión de spotatui que añade una cola colaborativa en tiempo real a Listening Party, con YouTube como fuente y el host como árbitro. Sin apps web, sin cuentas extra y sin depender de la Jam cerrada de Spotify.
 
 ### Diferenciadores
 
@@ -28,7 +28,7 @@ Una extensión de spotatui que añade una cola colaborativa en tiempo real a Lis
 
 ### Persona A — Host técnico
 
-Tiene spotatui y Spotify Premium. Organiza la escucha en casa, en la oficina o en un servidor de Discord. Quiere:
+Tiene spotatui con `yt-dlp`. Organiza la escucha en casa, en la oficina o en un servidor de Discord. Quiere:
 
 - Crear una sala en dos teclas y compartir un código.
 - Ver quién ha añadido cada track y quién está conectado.
@@ -39,7 +39,7 @@ Tiene spotatui y Spotify Premium. Organiza la escucha en casa, en la oficina o e
 
 Tiene spotatui y Premium. Quiere:
 
-- Unirse con un código, sin configurar un cliente de Spotify.
+- Unirse con un código, sin cuenta de Spotify.
 - Ver qué está sonando y qué viene después.
 - Buscar y añadir tracks desde su propia cuenta.
 - Votar o reordenar si el host lo permite.
@@ -82,7 +82,7 @@ Ctrl+P → "2" → ABC123 → nombre → Enter
 Invitado: "a" → overlay de búsqueda → escribe "burial archangel"
   → resultados con título/artista/duración
   → Enter → envía QueueAdd{uri, metadata, op_id}
-  → host valida: URI Spotify, cola no llena, rate limit, duplicado
+  → host valida: URI YouTube, cola no llena, rate limit, duplicado
   → host aplica, incrementa revision, difunde QueuePatch
   → todos ven el track al final; el invitado recibe ack
 ```
@@ -145,7 +145,7 @@ La v1 implementa “continuar contexto” y “parar”. Loop queda como P1.
 └─────────────────────────────────────────────────────────┘
 ```
 
-- La cola muestra solo tracks de Spotify en la v1.
+- La cola muestra solo vídeos de YouTube en la v1 (`youtube:<id>`).
 - El item seleccionado se resalta; `Enter` lo pone ahora solo si el usuario tiene permiso de control.
 - Los errores se muestran como status message, no como popup modal.
 - La pantalla funciona a 80 columnas; a anchos menores se oculta la columna “Añadido”.
@@ -223,7 +223,7 @@ Se puede permitir añadir a la cola sin permitir saltar, o permitir saltar sin p
 ### MVP (v0.1)
 
 - Protocolo v2 con cola, snapshot troceado, deltas, revisiones y acks.
-- Host autoritativo sobre `native_queue` (solo Spotify).
+- Host autoritativo sobre `native_queue` (solo YouTube en la cola).
 - Invitados: ver cola, buscar, añadir, quitar sus items.
 - Host: quitar, reordenar, vaciar, poner ahora, políticas y límites.
 - Pantalla Party completa en TUI.
@@ -237,7 +237,7 @@ Se puede permitir añadir a la cola sin permitir saltar, o permitir saltar sin p
 
 - Votación y orden por score.
 - Aprobación previa de tracks.
-- Exportar la cola a playlist de Spotify.
+- Exportar la cola a una playlist local/YouTube.
 - Invitado web de solo lectura + añadir (sin reproducción).
 - Relay Rust completo con TLS y Docker.
 - Reconexión del host con gracia de 60 s.
@@ -246,16 +246,16 @@ Se puede permitir añadir a la cola sin permitir saltar, o permitir saltar sin p
 ### P2 / exploratorio
 
 - Integración con Jam nativa vía `spotify_cli` (macOS, no documentada, flag experimental).
-- Invitados sin cuenta Spotify en modo jukebox (el host reproduce; los invitados solo controlan).
+- Invitados sin cuenta en modo jukebox (el host reproduce; los invitados solo controlan).
 - Sync de audio de mayor precisión (medición de offset, no solo seek).
-- Soporte de fuentes no Spotify en la cola (requiere que todos tengan la misma fuente).
+- Soporte de fuentes distintas de YouTube en la cola (requiere que todos tengan la misma fuente).
 - Aplicación web de host.
 
 ### No-goals
 
-- Retransmitir audio de Spotify a otros.
+- Retransmitir audio de YouTube a otros.
 - Interoperar con la Jam oficial sin API.
-- Sustituir Spotify como servicio.
+- Sustituir YouTube como servicio.
 - Monetización o servicio público multi-tenant.
 
 ## 9. Métricas de éxito
@@ -292,4 +292,4 @@ Se puede permitir añadir a la cola sin permitir saltar, o permitir saltar sin p
 
 > “Abre spotatui, pulsa Ctrl+P y crea una sala. Comparte el código. Tus amigos entran desde su terminal, ven tu cola y añaden canciones. Tú decides quién puede saltar. Cuando termináis, la cola se puede guardar como playlist.”
 
-La demo debe funcionar en una LAN sin internet salvo Spotify, con el relay Rust local. Ese es el escenario de aceptación emocional del producto.
+La demo debe funcionar en una LAN con internet para YouTube y `yt-dlp`, con el relay Rust local. Ese es el escenario de aceptación emocional del producto.

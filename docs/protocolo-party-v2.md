@@ -62,7 +62,7 @@ Reglas:
 ```json
 {
   "id": 17,
-  "uri": "spotify:track:7o2AeQZzfCERsRmOM86EcB",
+  "uri": "youtube:dQw4w9WgXcQ",
   "title": "Archangel",
   "artists": ["Burial"],
   "duration_ms": 299000,
@@ -76,7 +76,7 @@ Reglas:
 | Campo | Tipo | Reglas |
 |---|---|---|
 | `id` | u64 | Único en la sala, asignado por el host, estable |
-| `uri` | string | Solo `spotify:track:<22 base62>` en v1 |
+| `uri` | string | Solo `youtube:<id>` en la Party Queue v1 |
 | `title` | string | 1–120 chars en wire; se trunca con `…` |
 | `artists` | string[] | 1–8; cada uno ≤ 120 chars |
 | `duration_ms` | u32 | 1–3.600.000 |
@@ -140,7 +140,7 @@ Host → todos o a uno. Estado completo troceado.
   "chunk": 0,
   "chunks": 2,
   "to": "p-7f3a",
-  "current": { "id": 16, "uri": "spotify:track:...", "title": "Archangel", "artists": ["Burial"], "duration_ms": 299000, "added_by": "host", "added_by_name": "manu", "votes": 0, "added_at_ms": 1762891000000 },
+  "current": { "id": 16, "uri": "youtube:dQw4w9WgXcQ", "title": "Archangel", "artists": ["Burial"], "duration_ms": 299000, "added_by": "host", "added_by_name": "manu", "votes": 0, "added_at_ms": 1762891000000 },
   "items": [],
   "history_tail": []
 }
@@ -197,7 +197,7 @@ Invitado → host. El relay añade `from` (nombre) y `from_id` (id de sesión), 
   "base_rev": 42,
   "action": {
     "op": "add",
-    "uri": "spotify:track:...",
+    "uri": "youtube:dQw4w9WgXcQ",
     "title": "Archangel",
     "artists": ["Burial"],
     "duration_ms": 299000
@@ -254,7 +254,7 @@ Códigos de error:
 | `guest_limit` | `max_per_guest` alcanzado |
 | `rate_limited` | Cooldown o token bucket |
 | `duplicate` | URI ya presente y `dedupe=true` |
-| `invalid_uri` | No es `spotify:track:` válido |
+| `invalid_uri` | No es `youtube:<id>` válido |
 | `invalid_metadata` | Título/artistas/duración fuera de rango |
 | `not_playable` | El host no puede reproducirlo (opcional) |
 | `unknown_item` | `id` no existe |
@@ -277,7 +277,7 @@ El host responde con `queue_snapshot` dirigido (`to`) y la revisión actual. El 
 ```json
 {
   "type": "sync_state",
-  "track_uri": "spotify:track:...",
+  "track_uri": "youtube:dQw4w9WgXcQ",
   "position_ms": 42000,
   "is_playing": true,
   "timestamp": 1762891200000
@@ -346,7 +346,7 @@ Orden de comprobaciones para `add`:
 
 1. `queue_mode` permite add.
 2. `op_id` no procesado (idempotencia).
-3. `uri` cumple `spotify:track:<22 base62>`; no `episode`, `local`, `album`, URL.
+3. `uri` cumple `youtube:<id>`; no `youtube:playlist:`, URL, ni otras fuentes.
 4. `title` 1–200 chars; `artists` 1–8 × 200; `duration_ms` 1–3.600.000.
 5. Cola < `max_items`.
 6. Items del participante < `max_per_guest`.
@@ -404,14 +404,14 @@ Reglas:
 ### 9.1 Add aceptado
 
 ```json
-{"type":"queue_command","op_id":"a1","from":"p-1","base_rev":0,"action":{"op":"add","uri":"spotify:track:7o2AeQZzfCERsRmOM86EcB","title":"Archangel","artists":["Burial"],"duration_ms":299000}}
+{"type":"queue_command","op_id":"a1","from":"p-1","base_rev":0,"action":{"op":"add","uri":"youtube:dQw4w9WgXcQ","title":"Archangel","artists":["Burial"],"duration_ms":299000}}
 ```
 
 Respuesta:
 
 ```json
 {"type":"queue_ack","op_id":"a1","ok":true,"revision":1,"to":"p-1"}
-{"type":"queue_patch","revision":1,"ops":[{"op":"add","item":{"id":1,"uri":"spotify:track:7o2AeQZzfCERsRmOM86EcB","title":"Archangel","artists":["Burial"],"duration_ms":299000,"added_by":"p-1","added_by_name":"ana","votes":0,"added_at_ms":1762891200000}}]}
+{"type":"queue_patch","revision":1,"ops":[{"op":"add","item":{"id":1,"uri":"youtube:dQw4w9WgXcQ","title":"Archangel","artists":["Burial"],"duration_ms":299000,"added_by":"p-1","added_by_name":"ana","votes":0,"added_at_ms":1762891200000}}]}
 ```
 
 ### 9.2 Add duplicado
@@ -445,7 +445,7 @@ Host:
 ### 9.5 Avance natural
 
 ```json
-{"type":"queue_patch","revision":45,"ops":[{"op":"advance","current":{"id":18,"uri":"spotify:track:...","title":"Halcyon","artists":["Jon Hopkins"],"duration_ms":300000,"added_by":"host","added_by_name":"manu","votes":0,"added_at_ms":1762891300000},"played_id":17,"skipped":false}]}
+{"type":"queue_patch","revision":45,"ops":[{"op":"advance","current":{"id":18,"uri":"youtube:dQw4w9WgXcQ","title":"Halcyon","artists":["Jon Hopkins"],"duration_ms":300000,"added_by":"host","added_by_name":"manu","votes":0,"added_at_ms":1762891300000},"played_id":17,"skipped":false}]}
 ```
 
 ### 9.6 Error de permisos

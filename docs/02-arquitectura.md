@@ -34,7 +34,7 @@ Línea base auditada: commit `4c5fc99` (2026-11-10), versión 0.48.0, 353 archiv
 - El relay limita cada mensaje a **4 KB**; una cola de 100 items no cabe en un solo JSON.
 - El protocolo no tiene identidad estable de participante: solo nombres; no se puede atribuir un add o un voto con fiabilidad.
 - `SyncState` no incluye la cola ni un número de revisión.
-- El host solo sincroniza mientras reproduce Spotify; si cambia a local/YouTube/radio, la sala sigue abierta pero no hay sync.
+- El host solo sincroniza mientras reproduce YouTube en la Party Queue; si cambia a otra fuente, la sala sigue abierta pero la cola no avanza.
 - En modo `shared_control` los invitados ya envían transporte, aunque la documentación dice lo contrario; hay que corregir la doc.
 - No hay reconexión del host: si se cae, la sala muere y el código se pierde.
 
@@ -90,7 +90,7 @@ No se crea un daemon separado para la v1. Un daemon añade un proceso, un socket
 ```rust
 pub struct PartyQueueItem {
     pub id: u64,                    // asignado por el host, único en la sala
-    pub uri: String,                // solo spotify:track:<id> en v1
+    pub uri: String,                // solo youtube:<id> en la cola v1
     pub title: String,              // truncado a 200 chars
     pub artists: Vec<String>,       // máx. 8, cada uno 200 chars
     pub duration_ms: u32,           // 1..=3_600_000
@@ -152,12 +152,12 @@ fn sync_native_queue(&mut self) {
 
 Consecuencias:
 
-- Al iniciar la jam, si suena un track de Spotify se **adopta** como `current`; la `native_queue` existente se adopta como `items` (con ids nuevos) o se vacía, según configuración. Default: adoptar.
+- Al iniciar la jam, si suena un vídeo de YouTube se **adopta** como `current`; la `native_queue` existente se adopta como `items` (con ids nuevos) o se vacía, según configuración. Default: adoptar.
 - Cuando el motor consume un item (`AdvanceNativeQueue`), se notifica a `PartyQueue`: el `current` anterior pasa a `history`, el head de `items` pasa a `current` y se incrementa `revision`. Esto requiere un hook pequeño en `infra/queue`.
 - Si el motor introduce mutaciones externas que no pasan por la cola (reorder, clear desde la pantalla Queue), se reduce la ventana a 1–2 items y se materializa el siguiente explícitamente al avanzar. Es el plan B si la derivación completa resulta frágil.
 - Si el host añade un track por la pantalla Queue normal, se redirige a `PartyQueue` mientras la jam esté activa; si no, se comporta como siempre.
 - Al terminar la jam, `native_queue` queda como esté; no se destruye nada.
-- Los tracks no Spotify (local, YouTube, Qobuz, Subsonic, radio) **no entran** en `PartyQueue` v1. Si el host los añade, se rechazan con un mensaje claro. Esto mantiene la promesa “todos pueden reproducirlo”.
+- Solo los vídeos de YouTube (`youtube:<id>`) entran en `PartyQueue` v1. Las demás fuentes (local, Qobuz, Subsonic, radio) y los `spotify:track:` se rechazan con un mensaje claro.
 
 Alternativa considerada: mantener `PartyQueue` como metadata paralela y mutar `native_queue` a la vez. Se descarta por el riesgo de divergencia en reorder/consume. La variante de “solo materializar el siguiente item” se conserva como fallback si el motor no permite derivar la cola completa.
 
@@ -166,7 +166,7 @@ Alternativa considerada: mantener `PartyQueue` como metadata paralela y mutar `n
 1. `revision` es monotónica y nunca decrece.
 2. `items.len() + current.is_some() as usize <= config.max_items`.
 3. `item.id` es único y estable durante la sesión, incluido `current` e `history`.
-4. Solo hay URIs `spotify:track:` válidas.
+4. Solo hay URIs `youtube:<id>` válidas en la cola.
 5. El orden de `PartyQueue.items` es el orden de la ventana de `native_queue`; en v1, la ventana contiene los próximos items.
 6. `current` es el item que el motor tiene en `queue_now`; no está en `items`.
 7. Un `QueuePatch` con `revision = N` solo se aplica si la réplica está en `N-1`; si no, se pide snapshot.
@@ -374,7 +374,7 @@ La cola es independiente de quién reproduce. El protocolo separa `queue_mode` (
 
 | Modo | Quién reproduce | Requisitos | Uso |
 |---|---|---|---|
-| `follow_host` (MVP) | Cada participante, en su dispositivo, siguiendo al host | Todos Spotify Premium + spotatui | Sala remota/privada; reutiliza Listening Party |
+| `follow_host` (MVP) | Cada participante, en su dispositivo, siguiendo al host | spotatui + `yt-dlp` | Sala remota/privada; reutiliza Listening Party |
 | `host_only` (P1) | Solo el host, en su altavoz | Host Premium; invitados pueden no tener cuenta si usan web | Sala física/jukebox; no retransmite audio |
 
 En `host_only`, los invitados **no reciben audio**: si están en la misma habitación, oyen el altavoz del host; si están remotos, solo ven y controlan la cola. Esto evita el webcasting de III.4 y reduce la exposición. El invitado web sin cuenta es P1; en la TUI, un invitado con cuenta Free puede unirse si el login y la búsqueda funcionan sin reproducción (a validar en Fase 0).
@@ -390,7 +390,7 @@ El modo se negocia en `room_created`/`joined_room` y se muestra en la cabecera. 
 | `src/infra/network/sync.rs` | Añadir variantes v2 a `SyncMessage`; `PartySession` con `members: Vec<PartyMember>`, `queue_revision`, `features`; helpers de chunking/validación |
 | `src/infra/network/mod.rs` | Manejar `queue_command`, `queue_ack`, `queue_patch`, `queue_snapshot`, `queue_resync`; enviar snapshot al `guest_joined`; hook de `track_change` |
 | `src/core/app/party.rs` | `PartyQueue`/`PartyMirror`; métodos `apply_queue_command`, `apply_patch`, `request_resync`, `party_queue_add_local`; permisos |
-| `src/core/app/queue.rs` | Hook de consumo (`AdvanceNativeQueue` → `party_queue_pop`); materializar la ventana de `native_queue`; bloquear adds no Spotify durante jam; reconciliación |
+| `src/core/app/queue.rs` | Hook de consumo (`AdvanceNativeQueue` → `party_queue_pop`); materializar la ventana de `native_queue`; bloquear adds que no sean YouTube durante la jam; reconciliación |
 | `src/core/action/mod.rs` | Nuevas acciones: `PartyAddTrack`, `PartyRemoveTrack`, `PartyMoveTrack`, `PartyPlayNow`, `PartyVote`, `PartySetQueueMode` |
 | `src/tui/handlers/party.rs` | Navegación de la pantalla, atajos, búsqueda, confirmaciones |
 | `src/tui/ui/party.rs` (nuevo) | Layout de cola/miembros/ajustes |
@@ -402,7 +402,7 @@ El modo se negocia en `room_created`/`joined_room` y se muestra en la cabecera. 
 
 ### 7.2 Búsqueda para añadir
 
-El invitado ya tiene una sesión de Spotify y puede buscar. Opciones:
+El invitado puede buscar en YouTube con la fuente activa. Opciones:
 
 1. **Reutilizar la pantalla Search existente** con un modo “party add”. Al pulsar Enter sobre un track, en vez de reproducir, envía `QueueAdd`.
 2. **Overlay dedicado** dentro de Party. Es más limpio y evita perder el contexto de la cola.
@@ -504,7 +504,7 @@ Usar `spotify_cli` del cliente de escritorio (macOS) o endpoints internos para `
 | Invitado malicioso envía comandos no permitidos | Host valida permisos y límites; relay solo reenvía; ack de error |
 | Spoofing de `from` | El relay añade `from` y descarta el que envíe el cliente; el host usa el del relay |
 | Inyección de metadata (títulos con ANSI/control chars) | Sanitizar: quitar `\x00-\x1f`, limitar longitud, renderizar como texto |
-| URIs maliciosas / SSRF | Solo `spotify:track:` con ID base62; no se hacen requests a URLs de invitados |
+| URIs maliciosas / SSRF | Solo `youtube:<id>`; no se hacen requests a URLs de invitados |
 | Flood de comandos | Token bucket en relay (10 burst, 2/s) + rate limit en host por participante |
 | Mensajes gigantes | Límite 4 KB del relay; chunking; rechazar > 4 KB |
 | Suplantación del host | El relay solo acepta un host por sala y por IP; el host no acepta comandos de otro host |

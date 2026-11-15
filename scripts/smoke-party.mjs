@@ -165,7 +165,7 @@ async function main() {
     base_rev: 0,
     action: {
       op: "add",
-      uri: "spotify:track:7o2AeQZzfCERsRmOM86EcB",
+      uri: "youtube:dQw4w9WgXcQ",
       title: "Archangel",
       artists: ["Burial"],
       duration_ms: 299000,

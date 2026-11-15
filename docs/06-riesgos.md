@@ -1,5 +1,10 @@
 # 06 — Registro de riesgos
 
+> **Cambio de alcance (15 nov 2026):** la Party Queue implementada es **YouTube-only**.
+> Los riesgos R1/R2 sobre la Jam/Developer Policy de Spotify siguen aplicando al
+> transporte Spotify legado, pero no a la cola. El riesgo específico de YouTube es
+> la fragilidad de `yt-dlp` y los cambios de YouTube, ya asumido por spotatui.
+
 Escala: probabilidad (P) e impacto (I) de 1 a 5. Prioridad = P × I.
 
 | ID | Riesgo | P | I | Prio | Mitigación | Disparador |

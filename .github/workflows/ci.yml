@@ -1,0 +1,59 @@
+name: Repository CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  patch:
+    name: Patch applies to spotatui v0.48.0
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone the pinned base
+        run: |
+          git clone --depth 1 --branch v0.48.0 \
+            https://github.com/LargeModGames/spotatui.git /tmp/spotatui
+      - name: Apply the patch
+        run: |
+          cd /tmp/spotatui
+          git apply --check "$GITHUB_WORKSPACE/patches/0001-party-queue.patch"
+          git apply "$GITHUB_WORKSPACE/patches/0001-party-queue.patch"
+
+  relay-rust:
+    name: Rust relay
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: party-relay
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: party-relay
+      - run: cargo fmt -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  scripts:
+    name: Scripts and docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --check scripts/smoke-party.mjs
+      - run: bash -n scripts/bootstrap.sh scripts/smoke-youtube.sh
+      - name: Markdown links
+        uses: lycheeverse/lychee-action@v2
+        continue-on-error: true
+        with:
+          args: --no-progress "README.md" "docs/**/*.md" "research/**/*.md"

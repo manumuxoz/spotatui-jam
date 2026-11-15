@@ -58,7 +58,7 @@ El MVP se congela en el gate G3. Todo lo que no esté en Must va a P1/P2.
 | PQ-023 | Add/remove/move/clear local | Acciones del host | Funcionan con/sin party | L | Must |
 | PQ-024 | Play now | Mover al head y reproducir | Suena y se difunde | M | Must |
 | PQ-025 | Adoptar cola existente | Al iniciar la jam | Se adopta o vacía según config | S | Must |
-| PQ-026 | Rechazar fuentes no Spotify | Local/YouTube/Qobuz/Subsonic | Error claro; no entra | S | Must |
+| PQ-026 | Rechazar fuentes no YouTube | Spotify/local/Qobuz/Subsonic | Error claro; no entra | S | Must |
 | PQ-027 | Broadcast snapshot/patch/ack | Con coalescing 100 ms | Cliente de test recibe todo | L | Must |
 | PQ-028 | Sync inmediato en track change | No esperar 2 s | Guest cambia en < 2 s | M | Must |
 | PQ-029 | Tests de host | Unitarios + integración | Cobertura > 80 % | M | Must |
@@ -175,7 +175,7 @@ El MVP se congela en el gate G3. Todo lo que no esté en Must va a P1/P2.
 | PQ-120 | Puente `spotify_cli` | macOS/Windows, flag experimental | Won't |
 | PQ-121 | GraphQL interno | Prohibido por Terms | Won't |
 | PQ-122 | Sync fino < 100 ms | Requiere control de reloj | Won't |
-| PQ-123 | Fuentes no Spotify | Requiere misma fuente en todos | Won't |
+| PQ-123 | Fuentes no YouTube | Requiere misma fuente en todos | Won't |
 | PQ-124 | App web de host | Segundo frontend | Won't |
 | PQ-125 | Múltiples hosts / transferencia | Complejo | Won't |
 

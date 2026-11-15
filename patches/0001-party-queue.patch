@@ -1,4 +1,4 @@
-From 18a7ffb01ad850e07a10bba681e0ed2eb462f058 Mon Sep 17 00:00:00 2001
+From e5be7786be4203205db3ad0e3a4a91183e46d8b2 Mon Sep 17 00:00:00 2001
 From: manumuxoz <manuel.munhozvazquez@gmail.com>
 Date: Fri, 13 Nov 2026 17:16:21 +0100
 Subject: [PATCH] feat(party): add host-authoritative collaborative queue
@@ -9,21 +9,21 @@ Subject: [PATCH] feat(party): add host-authoritative collaborative queue
 - TUI queue in the party popup and the existing Queue screen
 - relay v2 for Cloudflare Workers and a Rust self-hosted relay
 ---
- docs/listening-party.md           |   39 +-
+ docs/listening-party.md           |   52 +-
  src/core/action/tests.rs          |    5 +
  src/core/app/construction.rs      |    1 +
  src/core/app/mod.rs               |    2 +
- src/core/app/party.rs             |   86 ++
- src/core/app/queue.rs             |   68 ++
+ src/core/app/party.rs             |  113 ++-
+ src/core/app/queue.rs             |   82 ++
  src/core/i18n/popups.rs           |   35 +
  src/core/i18n/template_tests.rs   |   10 +
  src/core/mod.rs                   |    3 +-
  src/core/party/mod.rs             |   14 +
- src/core/party/queue.rs           | 1323 +++++++++++++++++++++++++++++
+ src/core/party/queue.rs           | 1293 +++++++++++++++++++++++++++++
  src/gui/protocol.rs               |    5 +
  src/infra/network/library.rs      |    6 +-
- src/infra/network/mod.rs          |  763 ++++++++++++++++-
- src/infra/network/sync.rs         |  330 +++++++
+ src/infra/network/mod.rs          |  868 +++++++++++++++++--
+ src/infra/network/sync.rs         |  330 ++++++++
  src/tui/handlers/party.rs         |   36 +-
  src/tui/handlers/queue_menu.rs    |   16 +-
  src/tui/ui/popups.rs              |  239 +++++-
@@ -36,7 +36,7 @@ Subject: [PATCH] feat(party): add host-authoritative collaborative queue
  worker-relay/test/routing.test.ts |  223 +++++
  worker-relay/tsconfig.test.json   |   12 +
  worker-relay/wrangler.toml        |   33 +
- 27 files changed, 3762 insertions(+), 147 deletions(-)
+ 27 files changed, 3856 insertions(+), 182 deletions(-)
  create mode 100644 src/core/party/mod.rs
  create mode 100644 src/core/party/queue.rs
  create mode 100644 worker-relay/.gitignore
@@ -46,35 +46,46 @@ Subject: [PATCH] feat(party): add host-authoritative collaborative queue
  create mode 100644 worker-relay/tsconfig.test.json
 
 diff --git a/docs/listening-party.md b/docs/listening-party.md
-index 5bf112d..cb50e1a 100644
+index 5bf112d..106c45f 100644
 --- a/docs/listening-party.md
 +++ b/docs/listening-party.md
-@@ -4,6 +4,8 @@ A **Listening Party** keeps the playback of a host and one or more guests in syn
+@@ -2,7 +2,13 @@
  
- Every participant needs a Spotify login, and Spotify in spotatui needs Premium. The party follows Spotify tracks only: while the host plays another source, the room stays open but the guests get nothing new.
+ A **Listening Party** keeps the playback of a host and one or more guests in sync, so everyone hears the same track at the same position. spotatui connects them through a small WebSocket relay.
  
-+The party also has a **shared queue** (Party Queue v2). The host owns it; guests can add tracks and, depending on the room policy, remove or reorder them. The relay does not store the queue: it only routes revisioned snapshots and patches between the host and the guests.
+-Every participant needs a Spotify login, and Spotify in spotatui needs Premium. The party follows Spotify tracks only: while the host plays another source, the room stays open but the guests get nothing new.
++The **Party Queue** uses YouTube as its source: the host owns a shared queue of `youtube:<id>` videos, guests add videos, and every participant resolves the same video locally with `yt-dlp`. No Spotify account is required for the queue; the legacy Spotify sync remains available for the original Listening Party transport.
 +
++## Requirements
++
++- spotatui built with the `youtube` feature.
++- `yt-dlp` on `PATH`; `ffmpeg` recommended.
++- The relay reachable by every participant.
+ 
  ## Opening the party menu
  
- Press `Ctrl+p` (the `listening_party` key) in the terminal app. The desktop app has a **Listening party** page.
-@@ -13,6 +15,7 @@ Press `Ctrl+p` (the `listening_party` key) in the terminal app. The desktop app
+@@ -12,20 +18,48 @@ Press `Ctrl+p` (the `listening_party` key) in the terminal app. The desktop app
+ 
  Press `1`, `h` or `Enter` to start a party. spotatui creates a room on the relay and shows a **6-character code**. Share it with your guests.
  
- - Your track, position and play or pause state go to the guests every 2 seconds.
+-- Your track, position and play or pause state go to the guests every 2 seconds.
+-- `c` switches the control mode (below).
++- Your video, position and play or pause state go to the guests every 2 seconds.
 +- `Q` opens the shared queue on the existing Queue screen.
- - `c` switches the control mode (below).
++- `c` switches the playback control mode (below).
  - `l` ends the party. `Esc` only closes the menu; the party keeps running.
  
-@@ -20,12 +23,37 @@ Press `1`, `h` or `Enter` to start a party. spotatui creates a room on the relay
+ ## Joining
  
  Press `2` or `j`, type the 6-character code, then your display name (up to 32 characters), and press `Enter`. Your playback then follows the host. When your position drifts by more than about 3 seconds, spotatui seeks again, with the network delay taken into account. `l` leaves the party.
  
++The first time a YouTube video starts, `yt-dlp` downloads it locally. The guest keeps the request pending for up to 30 seconds so the 2-second sync tick does not restart the download.
++
 +## Shared queue
 +
 +The host is the only writer. Guests send intents; the host validates them and broadcasts the applied operations with a monotonic revision.
 +
-+- Add a track: search with `/`, select a track and press `z` (`add_item_to_queue`). It is sent to the host instead of the local queue.
++- Add a video: search YouTube with `/`, select a result and press `z` (`add_item_to_queue`). It is sent to the host instead of the local queue.
 +- Open the queue: `Q`. The existing Queue screen shows the shared queue while a party is active.
 +- Remove: `x` on the selected row.
 +- Reorder: `J` / `K`.
@@ -89,9 +100,9 @@ index 5bf112d..cb50e1a 100644
 +| `guests_add` (default) | Yes | No | No |
 +| `guests_manage` | Yes | Yes | Yes |
 +
-+Defaults: 100 tracks, 5 pending tracks per guest, one add every 2 seconds, duplicate URIs rejected. The host can change the policy in `config.yml` (a UI for this is P1).
++Defaults: 100 videos, 5 pending videos per guest, one add every 2 seconds, duplicate URIs rejected. The host can change the policy in `config.yml` (a UI for this is P1).
 +
-+Only `spotify:track:` URIs are accepted in v1. If the host is on an external Connect device, the queue cannot be authoritative; run the host on spotatui's own device.
++Only `youtube:<id>` URIs are accepted in the queue. `spotify:track:` and local/Subsonic/Qobuz/radio items are rejected with a status message. YouTube live streams are not finite tracks and should not be queued.
 +
  ## Control modes
  
@@ -101,11 +112,11 @@ index 5bf112d..cb50e1a 100644
 -| **Shared control** | The host accepts playback commands from guests. spotatui guests do not send any yet, so this changes nothing for them today. |
 +| **Shared control** | The host accepts playback commands from guests: play, pause, next, previous and seek. |
 +
-+Queue permissions are independent of playback control: a room can let guests add tracks without letting them skip.
++Queue permissions are independent of playback control: a room can let guests add videos without letting them skip.
  
  ## While a party runs
  
-@@ -39,3 +67,12 @@ The default relay is `wss://spotatui-party.spotatui.workers.dev/ws`. To use your
+@@ -39,3 +73,13 @@ The default relay is `wss://spotatui-party.spotatui.workers.dev/ws`. To use your
  behavior:
    relay_server_url: "wss://relay.example.com/ws"
  ```
@@ -118,6 +129,7 @@ index 5bf112d..cb50e1a 100644
 +- 4 KB per WebSocket message; snapshots are chunked by byte budget.
 +- The room closes when the host leaves and expires after 5 minutes without activity.
 +- The queue lives in memory; it is not persisted after the party ends.
++- YouTube/yt-dlp is an unofficial integration; if playback breaks, update `yt-dlp` first.
 diff --git a/src/core/action/tests.rs b/src/core/action/tests.rs
 index 4a1782d..c4e09e6 100644
 --- a/src/core/action/tests.rs
@@ -163,13 +175,14 @@ index 06652b0..da478c1 100644
    pending_track_table_selection: Option<PendingTrackSelection>,
    /// Maps visible track table rows to source playlist item positions.
 diff --git a/src/core/app/party.rs b/src/core/app/party.rs
-index 9f0c472..0ef61c0 100644
+index 9f0c472..55258c1 100644
 --- a/src/core/app/party.rs
 +++ b/src/core/app/party.rs
-@@ -3,6 +3,13 @@ use super::*;
+@@ -3,7 +3,14 @@ use super::*;
  /// The host sends its state every 2 s; a guest that heard none for longer stops relaying.
  const HOST_STATE_FRESH: Duration = Duration::from_secs(5);
  
+-#[cfg(test)]
 +fn party_now_ms() -> u64 {
 +  std::time::SystemTime::now()
 +    .duration_since(std::time::UNIX_EPOCH)
@@ -177,10 +190,11 @@ index 9f0c472..0ef61c0 100644
 +    .as_millis() as u64
 +}
 +
- #[cfg(test)]
++#[cfg(all(test, not(feature = "youtube")))]
  const PARTY_NEEDS_SPOTIFY: &str =
    "Listening Party needs Spotify. Press `d` and pick Spotify to log in.";
-@@ -12,6 +19,74 @@ impl App {
+ 
+@@ -12,6 +19,78 @@ impl App {
      &self.party_status
    }
  
@@ -199,6 +213,10 @@ index 9f0c472..0ef61c0 100644
 +
 +  pub(crate) fn party_is_active(&self) -> bool {
 +    self.party_session.is_some()
++  }
++
++  pub(crate) fn party_can_start(&self) -> bool {
++    self.spotify_connected || cfg!(feature = "youtube")
 +  }
 +
 +  pub fn party_is_host(&self) -> bool {
@@ -255,20 +273,69 @@ index 9f0c472..0ef61c0 100644
    pub(crate) fn party_session(&self) -> Option<&PartySession> {
      self.party_session.as_ref()
    }
-@@ -75,6 +150,12 @@ impl App {
+@@ -35,7 +114,7 @@ impl App {
+ 
+   /// Host a party; needs a Spotify session, the relay drives Spotify playback.
+   pub(crate) fn start_party(&mut self) {
+-    if !self.spotify_connected {
++    if !self.party_can_start() {
+       self.set_status_message(self.strings().status.app.party_needs_spotify, 6);
+       return;
+     }
+@@ -44,7 +123,7 @@ impl App {
+ 
+   /// Join a party; same session requirement as `start_party`.
+   pub(crate) fn join_party(&mut self, code: String, name: String) {
+-    if !self.spotify_connected {
++    if !self.party_can_start() {
+       self.set_status_message(self.strings().status.app.party_needs_spotify, 6);
+       return;
+     }
+@@ -75,6 +154,15 @@ impl App {
    /// not drive the host's queue slot. A parked native backend has no Spotify
    /// playback to relay or follow.
    pub(crate) fn party_yields_to_local_playback(&self) -> bool {
-+    // A queued Spotify track on the host is still Spotify playback: the party
-+    // must keep publishing it. Decoded queue items, local sources and Apple
-+    // Music remain unshareable.
-+    if self.party_is_host() && self.queue_now_is_spotify() {
++    // Spotify keeps its legacy transport. A YouTube party owns the decoded
++    // sink on purpose: each participant resolves the same video locally.
++    if self.party_is_host() && (self.queue_now_is_spotify() || self.queue_now_is_youtube()) {
++      return false;
++    }
++    #[cfg(feature = "youtube")]
++    if self.party_is_active() && self.youtube_playback.is_some() {
 +      return false;
 +    }
      self.apple_music_owns_playback()
        || self.playback_owner().owns_local_sink()
        || self.native_parked_here()
-@@ -202,9 +283,14 @@ mod tests {
+@@ -144,6 +232,19 @@ mod tests {
+   use crate::core::action::Action;
+   use crate::core::app::test_support::*;
+ 
++  #[cfg(feature = "youtube")]
++  #[test]
++  fn youtube_alone_can_host_a_party() {
++    let (tx, rx) = channel();
++    let mut app = App::new(tx, UserConfig::new(), None);
++    app.spotify_connected = false;
++
++    app.start_party();
++
++    assert!(matches!(rx.try_recv(), Ok(IoEvent::StartParty(_))));
++  }
++
++  #[cfg(not(feature = "youtube"))]
+   #[test]
+   fn start_party_without_a_session_dispatches_nothing_and_says_why() {
+     let (mut app, rx) = session_free_app();
+@@ -154,6 +255,7 @@ mod tests {
+     assert_eq!(app.status_message.as_deref(), Some(PARTY_NEEDS_SPOTIFY));
+   }
+ 
++  #[cfg(not(feature = "youtube"))]
+   #[test]
+   fn join_party_without_a_session_dispatches_nothing_and_keeps_the_input() {
+     let (mut app, rx) = session_free_app();
+@@ -202,9 +304,14 @@ mod tests {
        role,
        code: "ABC123".to_string(),
        guests: Vec::new(),
@@ -284,7 +351,7 @@ index 9f0c472..0ef61c0 100644
      (app, rx)
    }
 diff --git a/src/core/app/queue.rs b/src/core/app/queue.rs
-index ff47883..2f1897a 100644
+index ff47883..d42b3bb 100644
 --- a/src/core/app/queue.rs
 +++ b/src/core/app/queue.rs
 @@ -47,6 +47,27 @@ impl App {
@@ -302,8 +369,8 @@ index ff47883..2f1897a 100644
 +        self.set_status_message(self.strings().popups.party_relay_no_queue, 4);
 +        return;
 +      }
-+      if !crate::core::party::queue::is_spotify_track_uri(&uri) {
-+        self.set_status_message(self.strings().popups.party_queue_only_spotify, 4);
++      if !crate::core::party::queue::is_youtube_track_uri(&uri) {
++        self.set_status_message(self.strings().popups.party_queue_only_youtube, 4);
 +        return;
 +      }
 +      match crate::core::party::QueueAction::add(&track) {
@@ -390,8 +457,29 @@ index ff47883..2f1897a 100644
      self.native_queue.clear();
    }
  
+@@ -165,6 +233,20 @@ impl App {
+   /// the decoded-ownership predicates (`active_decoded_source`,
+   /// `active_decoded_player`, transport routing) — otherwise a space-bar toggle
+   /// or media key would resume the suspended player on top of librespot.
++  pub(crate) fn queue_now_is_youtube(&self) -> bool {
++    #[cfg(feature = "youtube")]
++    {
++      self
++        .queue_now_track()
++        .and_then(|track| track.uri.as_deref())
++        .is_some_and(|uri| uri.starts_with("youtube:"))
++    }
++    #[cfg(not(feature = "youtube"))]
++    {
++      false
++    }
++  }
++
+   pub(crate) fn queue_now_is_spotify(&self) -> bool {
+     #[cfg(feature = "streaming")]
+     {
 diff --git a/src/core/i18n/popups.rs b/src/core/i18n/popups.rs
-index d1159e4..648f5f2 100644
+index d1159e4..74797f4 100644
 --- a/src/core/i18n/popups.rs
 +++ b/src/core/i18n/popups.rs
 @@ -115,6 +115,15 @@ pub struct PopupStrings {
@@ -403,7 +491,7 @@ index d1159e4..648f5f2 100644
 +  pub party_queue_current_none: &'static str,
 +  pub party_queue_title_template: &'static str,
 +  pub party_queue_more_template: &'static str,
-+  pub party_queue_only_spotify: &'static str,
++  pub party_queue_only_youtube: &'static str,
 +  pub party_relay_no_queue: &'static str,
 +  pub party_host_only_play_now: &'static str,
 +  pub party_action_failed: &'static str,
@@ -419,7 +507,7 @@ index d1159e4..648f5f2 100644
 +  party_queue_current_none: "Nothing from the queue is playing",
 +  party_queue_title_template: "Queue {revision} · {count} track(s)",
 +  party_queue_more_template: "… and {count} more",
-+  party_queue_only_spotify: "Party Queue only accepts Spotify tracks",
++  party_queue_only_youtube: "Party Queue only accepts YouTube videos",
 +  party_relay_no_queue: "This relay does not support the party queue",
 +  party_host_only_play_now: "Only the host can play a track now",
 +  party_action_failed: "The queue operation failed",
@@ -508,10 +596,10 @@ index 0000000..936b3b3
 +};
 diff --git a/src/core/party/queue.rs b/src/core/party/queue.rs
 new file mode 100644
-index 0000000..14cc83e
+index 0000000..32c6e2f
 --- /dev/null
 +++ b/src/core/party/queue.rs
-@@ -0,0 +1,1323 @@
+@@ -0,0 +1,1293 @@
 +//! Party-queue domain model.
 +//!
 +//! This module is deliberately frontend- and network-neutral: it owns the
@@ -631,11 +719,11 @@ index 0000000..14cc83e
 +    let uri = track
 +      .uri
 +      .clone()
-+      .ok_or_else(|| PartyQueueError::new("invalid_uri", "El track no tiene URI de Spotify"))?;
-+    if !is_spotify_track_uri(&uri) {
++      .ok_or_else(|| PartyQueueError::new("invalid_uri", "El track no tiene URI de YouTube"))?;
++    if !is_youtube_track_uri(&uri) {
 +      return Err(PartyQueueError::new(
 +        "invalid_uri",
-+        "Solo se admiten tracks `spotify:track:`",
++        "Solo se admiten vídeos de YouTube (`youtube:<id>`)",
 +      ));
 +    }
 +    let title = sanitize(&track.name, 200);
@@ -645,7 +733,7 @@ index 0000000..14cc83e
 +        "El track no tiene título",
 +      ));
 +    }
-+    let artists: Vec<String> = track
++    let mut artists: Vec<String> = track
 +      .artists
 +      .iter()
 +      .map(|a| sanitize(a, 200))
@@ -653,10 +741,7 @@ index 0000000..14cc83e
 +      .take(8)
 +      .collect();
 +    if artists.is_empty() {
-+      return Err(PartyQueueError::new(
-+        "invalid_metadata",
-+        "El track no tiene artista",
-+      ));
++      artists.push("YouTube".to_string());
 +    }
 +    let duration_ms = track.duration_ms.min(u32::MAX as u64) as u32;
 +    if strict && (duration_ms == 0 || duration_ms > MAX_TRACK_MS) {
@@ -1358,6 +1443,32 @@ index 0000000..14cc83e
 +  }
 +}
 +
++/// Canonical URI the party transport may publish. The queue accepts YouTube
++/// only, but Listening Party keeps its legacy Spotify transport for v1 clients.
++pub fn canonical_party_uri(uri: &str) -> Option<String> {
++  if is_youtube_track_uri(uri) || is_spotify_track_uri(uri) {
++    return Some(uri.to_string());
++  }
++  // A legacy SyncState may carry a bare 22-character Spotify id.
++  if uri.len() == 22 && uri.chars().all(|c| c.is_ascii_alphanumeric()) {
++    return Some(format!("spotify:track:{uri}"));
++  }
++  None
++}
++
++pub fn is_youtube_track_uri(uri: &str) -> bool {
++  uri.strip_prefix("youtube:").is_some_and(|id| {
++    !id.is_empty()
++      && id.len() <= 64
++      && !id.contains([':', '/', '?', '&'])
++      && id
++        .chars()
++        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
++  })
++}
++
++/// Kept for callers that still need to recognise Spotify tracks in the legacy
++/// Listening Party transport; the Party Queue itself is YouTube-only.
 +pub fn is_spotify_track_uri(uri: &str) -> bool {
 +  uri
 +    .strip_prefix("spotify:track:")
@@ -1393,10 +1504,10 @@ index 0000000..14cc83e
 +  }
 +
 +  fn track(id: char, title: &str) -> TrackInfo {
-+    let base = "7o2AeQZzfCERsRmOM86EcB";
++    let base = "dQw4w9WgXcQ";
 +    let mut uri: Vec<char> = base.chars().collect();
 +    uri[0] = id;
-+    let uri = format!("spotify:track:{}", uri.into_iter().collect::<String>());
++    let uri = format!("youtube:{}", uri.into_iter().collect::<String>());
 +    TrackInfo {
 +      uri: Some(uri),
 +      name: title.to_string(),
@@ -1429,11 +1540,7 @@ index 0000000..14cc83e
 +  fn host_adds_a_track() {
 +    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
 +    let ops = queue
-+      .apply_action(
-+        add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "Archangel"),
-+        &host(),
-+        NOW,
-+      )
++      .apply_action(add("youtube:dQw4w9WgXcQ", "Archangel"), &host(), NOW)
 +      .unwrap();
 +    assert_eq!(queue.items.len(), 1);
 +    assert_eq!(queue.revision, 1);
@@ -1451,11 +1558,7 @@ index 0000000..14cc83e
 +    );
 +    queue.set_members(vec![host(), guest("p-1")]);
 +    let err = queue
-+      .apply_action(
-+        add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "Archangel"),
-+        &guest("p-1"),
-+        NOW,
-+      )
++      .apply_action(add("youtube:dQw4w9WgXcQ", "Archangel"), &guest("p-1"), NOW)
 +      .unwrap_err();
 +    assert_eq!(err.code(), "forbidden");
 +  }
@@ -1465,11 +1568,7 @@ index 0000000..14cc83e
 +    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
 +    queue.set_members(vec![host(), guest("p-1")]);
 +    queue
-+      .apply_action(
-+        add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "Archangel"),
-+        &guest("p-1"),
-+        NOW,
-+      )
++      .apply_action(add("youtube:dQw4w9WgXcQ", "Archangel"), &guest("p-1"), NOW)
 +      .unwrap();
 +    assert_eq!(queue.items.len(), 1);
 +    assert_eq!(queue.items[0].added_by, "p-1");
@@ -1480,7 +1579,7 @@ index 0000000..14cc83e
 +    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
 +    assert_eq!(
 +      queue
-+        .apply_action(add("spotify:album:abc", "x"), &host(), NOW)
++        .apply_action(add("youtube:playlist:abc", "x"), &host(), NOW)
 +        .unwrap_err()
 +        .code(),
 +      "invalid_uri"
@@ -1489,7 +1588,7 @@ index 0000000..14cc83e
 +      queue
 +        .apply_action(
 +          QueueAction::Add {
-+            uri: "spotify:track:7o2AeQZzfCERsRmOM86EcB".to_string(),
++            uri: "youtube:dQw4w9WgXcQ".to_string(),
 +            title: String::new(),
 +            artists: vec!["Burial".to_string()],
 +            duration_ms: 1000,
@@ -1506,7 +1605,7 @@ index 0000000..14cc83e
 +  #[test]
 +  fn dedupes_by_uri() {
 +    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
-+    let action = add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "Archangel");
++    let action = add("youtube:dQw4w9WgXcQ", "Archangel");
 +    queue.apply_action(action.clone(), &host(), NOW).unwrap();
 +    assert_eq!(
 +      queue
@@ -1530,38 +1629,22 @@ index 0000000..14cc83e
 +    );
 +    queue.set_members(vec![host(), guest("p-1")]);
 +    queue
-+      .apply_action(
-+        add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "A"),
-+        &guest("p-1"),
-+        NOW,
-+      )
++      .apply_action(add("youtube:dQw4w9WgXcQ", "A"), &guest("p-1"), NOW)
 +      .unwrap();
 +    assert_eq!(
 +      queue
-+        .apply_action(
-+          add("spotify:track:7o2AeQZzfCERsRmOM86EcX", "B"),
-+          &guest("p-1"),
-+          NOW
-+        )
++        .apply_action(add("youtube:9bZkp7q19f0", "B"), &guest("p-1"), NOW)
 +        .unwrap_err()
 +        .code(),
 +      "guest_limit"
 +    );
 +    queue.set_members(vec![host(), guest("p-2")]);
 +    queue
-+      .apply_action(
-+        add("spotify:track:7o2AeQZzfCERsRmOM86EcX", "B"),
-+        &guest("p-2"),
-+        NOW,
-+      )
++      .apply_action(add("youtube:9bZkp7q19f0", "B"), &guest("p-2"), NOW)
 +      .unwrap();
 +    assert_eq!(
 +      queue
-+        .apply_action(
-+          add("spotify:track:7o2AeQZzfCERsRmOM86EcY", "C"),
-+          &host(),
-+          NOW
-+        )
++        .apply_action(add("youtube:kJQP7kiw5Fk", "C"), &host(), NOW)
 +        .unwrap_err()
 +        .code(),
 +      "queue_full"
@@ -1573,19 +1656,11 @@ index 0000000..14cc83e
 +    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
 +    queue.set_members(vec![host(), guest("p-1")]);
 +    queue
-+      .apply_action(
-+        add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "A"),
-+        &guest("p-1"),
-+        NOW,
-+      )
++      .apply_action(add("youtube:dQw4w9WgXcQ", "A"), &guest("p-1"), NOW)
 +      .unwrap();
 +    assert_eq!(
 +      queue
-+        .apply_action(
-+          add("spotify:track:7o2AeQZzfCERsRmOM86EcX", "B"),
-+          &guest("p-1"),
-+          NOW + 1
-+        )
++        .apply_action(add("youtube:9bZkp7q19f0", "B"), &guest("p-1"), NOW + 1)
 +        .unwrap_err()
 +        .code(),
 +      "rate_limited"
@@ -1596,7 +1671,10 @@ index 0000000..14cc83e
 +  fn move_uses_after_and_keeps_ids_stable() {
 +    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
 +    for (i, c) in ["A", "B", "C"].iter().enumerate() {
-+      let uri = format!("spotify:track:7o2AeQZzfCERsRmOM86Ec{}", c);
++      let uri = format!(
++        "youtube:{}",
++        ["dQw4w9WgXcQ", "9bZkp7q19f0", "kJQP7kiw5Fk"][i]
++      );
 +      queue
 +        .apply_action(add(&uri, c), &host(), NOW + i as u64 * 3_000)
 +        .unwrap();
@@ -1620,11 +1698,7 @@ index 0000000..14cc83e
 +  fn move_rejects_a_missing_anchor() {
 +    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
 +    queue
-+      .apply_action(
-+        add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "A"),
-+        &host(),
-+        NOW,
-+      )
++      .apply_action(add("youtube:dQw4w9WgXcQ", "A"), &host(), NOW)
 +      .unwrap();
 +    let id = queue.items[0].id;
 +    assert_eq!(
@@ -1647,18 +1721,10 @@ index 0000000..14cc83e
 +  fn play_now_moves_the_previous_current_to_history() {
 +    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
 +    queue
-+      .apply_action(
-+        add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "A"),
-+        &host(),
-+        NOW,
-+      )
++      .apply_action(add("youtube:dQw4w9WgXcQ", "A"), &host(), NOW)
 +      .unwrap();
 +    queue
-+      .apply_action(
-+        add("spotify:track:7o2AeQZzfCERsRmOM86EcX", "B"),
-+        &host(),
-+        NOW,
-+      )
++      .apply_action(add("youtube:9bZkp7q19f0", "B"), &host(), NOW)
 +      .unwrap();
 +    let second = queue.items[1].id;
 +    let ops = queue
@@ -1694,7 +1760,7 @@ index 0000000..14cc83e
 +    first.id = 1;
 +    let mut second = first.clone();
 +    second.id = 2;
-+    second.uri = "spotify:track:7o2AeQZzfCERsRmOM86EcX".to_string();
++    second.uri = "youtube:9bZkp7q19f0".to_string();
 +    queue
 +      .apply_patch(&QueuePatch {
 +        revision: 1,
@@ -1752,11 +1818,7 @@ index 0000000..14cc83e
 +  fn observe_playback_advances_the_head() {
 +    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
 +    queue
-+      .apply_action(
-+        add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "A"),
-+        &host(),
-+        NOW,
-+      )
++      .apply_action(add("youtube:dQw4w9WgXcQ", "A"), &host(), NOW)
 +      .unwrap();
 +    let uri = queue.items[0].uri.clone();
 +    let op = queue.observe_playback(&uri, NOW).unwrap();
@@ -1769,15 +1831,11 @@ index 0000000..14cc83e
 +  fn observe_playback_clears_current_for_a_context_track() {
 +    let mut queue = PartyQueue::with_host(PartyQueueConfig::default(), host());
 +    queue
-+      .apply_action(
-+        add("spotify:track:7o2AeQZzfCERsRmOM86EcB", "A"),
-+        &host(),
-+        NOW,
-+      )
++      .apply_action(add("youtube:dQw4w9WgXcQ", "A"), &host(), NOW)
 +      .unwrap();
 +    let uri = queue.items[0].uri.clone();
 +    queue.observe_playback(&uri, NOW);
-+    let other = "spotify:track:7o2AeQZzfCERsRmOM86EcZ";
++    let other = "youtube:JGwWNGJdvx8";
 +    assert!(matches!(
 +      queue.observe_playback(other, NOW),
 +      Some(QueueOp::ClearCurrent)
@@ -1800,7 +1858,7 @@ index 0000000..14cc83e
 +    let mut mirror = PartyQueue::with_host(PartyQueueConfig::default(), host());
 +    for i in 0..200 {
 +      let id = next() % 1_000_000;
-+      let uri = format!("spotify:track:{:022}", id % 1_000_000_000_000);
++      let uri = format!("youtube:v{:010}", id % 1_000_000_000_000);
 +      let ops = match next() % 4 {
 +        0 => host_queue.apply_action(add(&uri, &format!("T{i}")), &host(), NOW + i),
 +        1 => host_queue.apply_action(
@@ -1879,10 +1937,15 @@ index eed62d3..c92594c 100644
        selected.owner_username(),
        selected.length().max(0) as u32,
 diff --git a/src/infra/network/mod.rs b/src/infra/network/mod.rs
-index ce29d65..ce854d5 100644
+index ce29d65..2672f71 100644
 --- a/src/infra/network/mod.rs
 +++ b/src/infra/network/mod.rs
-@@ -18,6 +18,7 @@ pub mod utils;
+@@ -14,10 +14,11 @@ pub mod sync;
+ pub mod user;
+ pub mod utils;
+ 
+-#[cfg(test)]
++#[cfg(all(test, not(feature = "youtube")))]
  use crate::core::app::SPOTIFY_NOT_CONNECTED_STATUS;
  use crate::core::app::{App, PlaybackOwner};
  use crate::core::auth::SpotifyLogin;
@@ -1899,26 +1962,29 @@ index ce29d65..ce854d5 100644
    /// Search tracks to add to a new playlist
    SearchTracksForPlaylist(String),
    /// Create a new playlist: playlist name, track ids/URIs.
-@@ -431,6 +434,9 @@ pub struct Network {
+@@ -431,6 +434,11 @@ pub struct Network {
    native_idle_recovery: playback::NativeIdleRecoveryState,
    pub party_connection: Option<sync::PartyConnection>,
    pub party_incoming_rx: Option<tokio::sync::mpsc::UnboundedReceiver<sync::SyncMessage>>,
 +  party_snapshot_assembler: crate::core::party::SnapshotAssembler,
 +  /// Recent queue intent ids, so a retry after a reconnect cannot duplicate.
 +  party_seen_ops: std::collections::HashSet<String>,
++  /// A YouTube start already requested by a guest, with its request time.
++  party_pending_start: Option<(String, std::time::Instant)>,
    /// The pairing prompt of an in-app login that waits for the approval in the browser.
    login_prompt: Option<SpotifyPairingPrompt>,
    /// How many playback polls in a row came back 401. A lone 401 is noise; only
-@@ -501,6 +507,8 @@ impl Network {
+@@ -501,6 +509,9 @@ impl Network {
        native_idle_recovery: playback::NativeIdleRecoveryState::default(),
        party_connection: None,
        party_incoming_rx: None,
 +      party_snapshot_assembler: Default::default(),
 +      party_seen_ops: Default::default(),
++      party_pending_start: None,
        login_prompt: None,
        consecutive_playback_auth_failures: 0,
        artist_cache: Default::default(),
-@@ -578,6 +586,7 @@ impl Network {
+@@ -578,6 +589,7 @@ impl Network {
          | IoEvent::LeaveParty
          | IoEvent::SyncPlayback
          | IoEvent::PartyPlaybackCommand(_)
@@ -1926,7 +1992,7 @@ index ce29d65..ce854d5 100644
          | IoEvent::GetLocalPlaylists
          | IoEvent::GetLocalTracks(_)
          | IoEvent::GetSubsonicPlaylists
-@@ -1091,6 +1100,9 @@ impl Network {
+@@ -1091,6 +1103,9 @@ impl Network {
        IoEvent::PartyPlaybackCommand(action) => {
          self.party_playback_command(action).await;
        }
@@ -1936,7 +2002,19 @@ index ce29d65..ce854d5 100644
        IoEvent::SearchTracksForPlaylist(query) => {
          self.search_tracks_for_playlist(query).await;
        }
-@@ -1544,6 +1556,7 @@ impl Network {
+@@ -1524,9 +1539,8 @@ impl Network {
+   }
+   async fn start_party(&mut self, control_mode: sync::ControlMode) {
+     // The event bypasses the auth gate, so the handler carries the requirement
+-    // itself: the relay drives Spotify playback, and opening the socket first
+-    // would leave a live party the drain has to close again.
+-    if self.spotify.is_none() {
++    // itself: the relay can drive Spotify or a local YouTube session.
++    if self.spotify.is_none() && !cfg!(feature = "youtube") {
+       self
+         .show_status_message(
+           self
+@@ -1544,6 +1558,7 @@ impl Network {
      {
        let mut app = self.app.lock().await;
        app.set_party_status(sync::PartyStatus::Connecting);
@@ -1944,7 +2022,7 @@ index ce29d65..ce854d5 100644
      }
  
      let relay_url = {
-@@ -1556,7 +1569,18 @@ impl Network {
+@@ -1556,7 +1571,18 @@ impl Network {
        sync::ControlMode::SharedControl => "shared_control",
      };
  
@@ -1964,7 +2042,7 @@ index ce29d65..ce854d5 100644
        Ok((conn, read)) => {
          let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
          tokio::spawn(sync::start_party_reader(read, incoming_tx));
-@@ -1569,9 +1593,14 @@ impl Network {
+@@ -1569,9 +1595,14 @@ impl Network {
            role: sync::PartyRole::Host,
            code: String::new(),
            guests: Vec::new(),
@@ -1979,7 +2057,16 @@ index ce29d65..ce854d5 100644
          }));
        }
        Err(e) => {
-@@ -1608,6 +1637,7 @@ impl Network {
+@@ -1590,7 +1621,7 @@ impl Network {
+ 
+   async fn join_party(&mut self, code: String, name: String) {
+     // Same requirement as `start_party`.
+-    if self.spotify.is_none() {
++    if self.spotify.is_none() && !cfg!(feature = "youtube") {
+       self
+         .show_status_message(
+           self
+@@ -1608,6 +1639,7 @@ impl Network {
      {
        let mut app = self.app.lock().await;
        app.set_party_status(sync::PartyStatus::Connecting);
@@ -1987,7 +2074,7 @@ index ce29d65..ce854d5 100644
      }
  
      let relay_url = {
-@@ -1615,7 +1645,18 @@ impl Network {
+@@ -1615,7 +1647,18 @@ impl Network {
        app.user_config.behavior.relay_server_url.clone()
      };
  
@@ -2007,7 +2094,7 @@ index ce29d65..ce854d5 100644
        Ok((conn, read)) => {
          let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
          tokio::spawn(sync::start_party_reader(read, incoming_tx));
-@@ -1628,9 +1669,14 @@ impl Network {
+@@ -1628,9 +1671,14 @@ impl Network {
            role: sync::PartyRole::Guest,
            code: code.to_uppercase(),
            guests: Vec::new(),
@@ -2022,12 +2109,13 @@ index ce29d65..ce854d5 100644
          }));
        }
        Err(e) => {
-@@ -1653,13 +1699,32 @@ impl Network {
+@@ -1653,13 +1701,33 @@ impl Network {
      }
      self.party_connection = None;
      self.party_incoming_rx = None;
 +    self.party_snapshot_assembler = Default::default();
 +    self.party_seen_ops.clear();
++    self.party_pending_start = None;
  
      let mut app = self.app.lock().await;
      app.set_party_status(sync::PartyStatus::Disconnected);
@@ -2055,7 +2143,16 @@ index ce29d65..ce854d5 100644
      let sync_state = {
        let app = self.app.lock().await;
        let session = match app.party_session() {
-@@ -1714,11 +1779,268 @@ impl Network {
+@@ -1675,7 +1743,7 @@ impl Network {
+         crate::infra::media_metadata::current_playback_snapshot(&app).and_then(|snapshot| {
+           let track_uri = snapshot
+             .item_uri
+-            .and_then(|uri| ids::playable_id(&uri).map(|id| id.uri()))?;
++            .and_then(|uri| crate::core::party::queue::canonical_party_uri(&uri))?;
+           Some(sync::SyncMessage::SyncState {
+             track_uri,
+             position_ms: snapshot.progress_ms as u64,
+@@ -1714,11 +1782,268 @@ impl Network {
    }
  
    async fn party_playback_command(&mut self, action: sync::PlaybackAction) {
@@ -2143,7 +2240,7 @@ index ce29d65..ce854d5 100644
 +        self
 +          .send_party_message(&sync::SyncMessage::QueuePatch(patch))
 +          .await;
-       }
++      }
 +      if let Some(uri) = play_now_uri {
 +        let mut app = self.app.lock().await;
 +        app.start_playback_uris(vec![uri], None);
@@ -2306,7 +2403,7 @@ index ce29d65..ce854d5 100644
 +          None,
 +          None,
 +        ),
-+      }
+       }
 +    };
 +    if let Some(patch) = advance_patch {
 +      self
@@ -2327,7 +2424,16 @@ index ce29d65..ce854d5 100644
      }
    }
  
-@@ -1761,43 +2083,172 @@ impl Network {
+@@ -1727,7 +2052,7 @@ impl Network {
+     // there is nothing to sync and `spotify()` would panic the pump. Close the
+     // party instead of returning, so an unread receiver cannot grow without a
+     // bound. The guard keeps the common no-party drain to one comparison.
+-    if self.spotify.is_none() {
++    if self.spotify.is_none() && !cfg!(feature = "youtube") {
+       if self.party_connection.is_some() || self.party_incoming_rx.is_some() {
+         self.leave_party().await;
+         self
+@@ -1761,43 +2086,172 @@ impl Network {
      let mut latest_state = None;
      for msg in messages {
        match msg {
@@ -2509,7 +2615,7 @@ index ce29d65..ce854d5 100644
          }
          sync::SyncMessage::SetControlMode { control_mode } => {
            let mut app = self.app.lock().await;
-@@ -1813,25 +2264,40 @@ impl Network {
+@@ -1813,25 +2267,40 @@ impl Network {
          }
          sync::SyncMessage::RoomClosed => {
            self.party_connection = None;
@@ -2562,7 +2668,92 @@ index ce29d65..ce854d5 100644
          }
          _ => {}
        }
-@@ -1969,6 +2435,12 @@ impl Network {
+@@ -1858,7 +2327,7 @@ impl Network {
+   ) {
+     // The canonical URI: a bare id would compare unequal to the current
+     // track's URI and restart it on every state.
+-    let Some(track_uri) = ids::playable_id(&track_uri).map(|id| id.uri()) else {
++    let Some(track_uri) = crate::core::party::queue::canonical_party_uri(&track_uri) else {
+       return;
+     };
+     let mut app = self.app.lock().await;
+@@ -1884,30 +2353,46 @@ impl Network {
+       position_ms
+     };
+ 
+-    let (current_uri, current_is_playing, current_progress) = {
+-      let uri = match &app.current_playback_context {
+-        Some(ctx) => match &ctx.item {
+-          Some(rspotify::model::PlayableItem::Track(t)) => {
+-            t.id.as_ref().map(|id| id.uri()).unwrap_or_default()
+-          }
+-          Some(rspotify::model::PlayableItem::Episode(e)) => e.id.uri(),
+-          Some(_) | None => String::new(),
+-        },
+-        None => String::new(),
++    let (current_uri, current_is_playing, current_progress) =
++      if let Some(snapshot) = crate::infra::media_metadata::current_playback_snapshot(&app) {
++        (
++          snapshot.item_uri.unwrap_or_default(),
++          snapshot.is_playing,
++          snapshot.progress_ms as u64,
++        )
++      } else {
++        let uri = match &app.current_playback_context {
++          Some(ctx) => match &ctx.item {
++            Some(rspotify::model::PlayableItem::Track(t)) => {
++              t.id.as_ref().map(|id| id.uri()).unwrap_or_default()
++            }
++            Some(rspotify::model::PlayableItem::Episode(e)) => e.id.uri(),
++            Some(_) | None => String::new(),
++          },
++          None => String::new(),
++        };
++        let playing = app
++          .current_playback_context
++          .as_ref()
++          .map(|c| c.is_playing)
++          .unwrap_or(false);
++        (uri, playing, app.song_progress_ms as u64)
+       };
+-      let playing = app
+-        .current_playback_context
+-        .as_ref()
+-        .map(|c| c.is_playing)
+-        .unwrap_or(false);
+-      let progress = app.song_progress_ms as u64;
+-      (uri, playing, progress)
+-    };
+ 
+-    // Track change takes priority
++    // Track change takes priority. A YouTube start is a yt-dlp download, so a
++    // 2 s SyncState would restart it before the player reports the new URI.
+     let switched_track = current_uri != track_uri;
+     if switched_track {
+-      app.start_playback_uris(vec![track_uri], None);
++      let youtube = track_uri.starts_with("youtube:");
++      let pending = self.party_pending_start.as_ref().is_some_and(|(uri, at)| {
++        uri == &track_uri && at.elapsed() < std::time::Duration::from_secs(30)
++      });
++      if !youtube || !pending {
++        self.party_pending_start = Some((track_uri.clone(), std::time::Instant::now()));
++        app.start_playback_uris(vec![track_uri], None);
++      }
++    } else {
++      self.party_pending_start = None;
+     }
+ 
+     // Play/pause sync
+@@ -1958,7 +2443,7 @@ impl Network {
+         }
+       }
+       sync::PlaybackAction::PlayTrack { uri } => {
+-        if let Some(uri) = ids::playable_id(&uri).map(|id| id.uri()) {
++        if let Some(uri) = crate::core::party::queue::canonical_party_uri(&uri) {
+           app.start_playback_uris(vec![uri], None);
+         }
+       }
+@@ -1969,6 +2454,12 @@ impl Network {
    }
  }
  
@@ -2575,7 +2766,7 @@ index ce29d65..ce854d5 100644
  /// Keep diagnostics and the CLI byte-identical while giving the UI a localized context.
  fn report_request_error(app: &mut App, error: anyhow::Error) {
    let message = app
-@@ -1982,6 +2454,106 @@ fn report_request_error(app: &mut App, error: anyhow::Error) {
+@@ -1982,6 +2473,106 @@ fn report_request_error(app: &mut App, error: anyhow::Error) {
  #[cfg(test)]
  mod tests {
  
@@ -2652,7 +2843,7 @@ index ce29d65..ce854d5 100644
 +
 +    guest
 +      .party_queue_command(crate::core::party::QueueAction::Add {
-+        uri: "spotify:track:7o2AeQZzfCERsRMOM86EcB".to_string(),
++        uri: "youtube:dQw4w9WgXcQ".to_string(),
 +        title: "Archangel".to_string(),
 +        artists: vec!["Burial".to_string()],
 +        duration_ms: 299_000,
@@ -2682,7 +2873,31 @@ index ce29d65..ce854d5 100644
    #[tokio::test]
    async fn speaker_errors_use_the_active_ui_language_without_losing_the_error_route() {
      use crate::core::i18n::{Language, LocalizedMessage};
-@@ -2638,9 +3210,14 @@ mod tests {
+@@ -2583,6 +3174,7 @@ mod tests {
+     Arc::new(Mutex::new(App::new(io_tx, UserConfig::new(), None)))
+   }
+ 
++  #[cfg(not(feature = "youtube"))]
+   #[tokio::test]
+   async fn start_party_without_a_session_opens_no_relay() {
+     let app = app_without_a_session();
+@@ -2597,6 +3189,7 @@ mod tests {
+     assert_eq!(app.status_message(), Some(SPOTIFY_NOT_CONNECTED_STATUS));
+   }
+ 
++  #[cfg(not(feature = "youtube"))]
+   #[tokio::test]
+   async fn join_party_without_a_session_opens_no_relay() {
+     let app = app_without_a_session();
+@@ -2613,6 +3206,7 @@ mod tests {
+     assert_eq!(app.status_message(), Some(SPOTIFY_NOT_CONNECTED_STATUS));
+   }
+ 
++  #[cfg(not(feature = "youtube"))]
+   #[tokio::test]
+   async fn process_party_messages_closes_a_party_that_outlived_its_session() {
+     let app = app_without_a_session();
+@@ -2638,9 +3232,14 @@ mod tests {
        role,
        code: "ABC123".to_string(),
        guests: Vec::new(),
@@ -2697,7 +2912,7 @@ index ce29d65..ce854d5 100644
      }
    }
  
-@@ -2654,10 +3231,15 @@ mod tests {
+@@ -2654,10 +3253,15 @@ mod tests {
    async fn party_network(app: &Arc<Mutex<App>>, role: sync::PartyRole) -> Network {
      let mut network = session_free_network(app);
      network.spotify = Some(SpotifyLogin::new());
@@ -2717,7 +2932,7 @@ index ce29d65..ce854d5 100644
      network
    }
  
-@@ -2683,9 +3265,121 @@ mod tests {
+@@ -2683,7 +3287,119 @@ mod tests {
      sync::SyncMessage::PlaybackCommand {
        action: sync::PlaybackAction::Pause,
        from: None,
@@ -2728,7 +2943,7 @@ index ce29d65..ce854d5 100644
 +  fn party_item(id: u64) -> crate::core::party::PartyQueueItem {
 +    crate::core::party::PartyQueueItem {
 +      id,
-+      uri: format!("spotify:track:{:022}", id),
++      uri: format!("youtube:v{:010}", id),
 +      title: format!("Track {id}"),
 +      artists: vec!["Artist".to_string()],
 +      duration_ms: 299_000,
@@ -2736,9 +2951,9 @@ index ce29d65..ce854d5 100644
 +      added_by_name: "ana".to_string(),
 +      votes: 0,
 +      added_at_ms: sync::now_ms(),
-     }
-   }
- 
++    }
++  }
++
 +  #[tokio::test]
 +  async fn a_host_applies_a_guest_queue_command() {
 +    let (app, _rx) = app_with_a_session();
@@ -2752,7 +2967,7 @@ index ce29d65..ce854d5 100644
 +        from_id: Some("p-1".to_string()),
 +        base_rev: 0,
 +        action: crate::core::party::QueueAction::Add {
-+          uri: "spotify:track:7o2AeQZzfCERsRmOM86EcB".to_string(),
++          uri: "youtube:dQw4w9WgXcQ".to_string(),
 +          title: "Archangel".to_string(),
 +          artists: vec!["Burial".to_string()],
 +          duration_ms: 299_000,
@@ -2811,7 +3026,7 @@ index ce29d65..ce854d5 100644
 +        }),
 +      )
 +      .await;
-+    }
+     }
 +    let app = app.lock().await;
 +    assert_eq!(app.party_queue().revision, 3);
 +    assert_eq!(app.party_queue().items.len(), 1);
@@ -2834,12 +3049,41 @@ index ce29d65..ce854d5 100644
 +    let app = app.lock().await;
 +    let session = app.party_session().unwrap();
 +    assert!(session.members.iter().any(|member| member.id == "p-9"));
+   }
+ 
+   #[tokio::test]
+@@ -2700,6 +3416,30 @@ mod tests {
+     assert!(rx.try_recv().is_err());
+   }
+ 
++  #[cfg(feature = "youtube")]
++  #[tokio::test]
++  async fn a_guest_follows_a_youtube_host_state() {
++    let (app, rx) = app_with_a_session();
++    let mut network = party_network(&app, sync::PartyRole::Guest).await;
++
++    relay(
++      &mut network,
++      sync::SyncMessage::SyncState {
++        track_uri: "youtube:dQw4w9WgXcQ".to_string(),
++        position_ms: 0,
++        is_playing: true,
++        timestamp: sync::now_ms(),
++      },
++    )
++    .await;
++
++    assert!(matches!(
++      rx.try_recv(),
++      Ok(IoEvent::StartPlayback(None, Some(uris), None))
++        if uris == ["youtube:dQw4w9WgXcQ"]
++    ));
 +  }
 +
    #[tokio::test]
-   async fn a_guest_follows_the_host_through_a_dispatched_start() {
+   async fn a_bare_track_id_from_the_host_starts_the_full_uri() {
      let (app, rx) = app_with_a_session();
-@@ -2768,6 +3462,7 @@ mod tests {
+@@ -2768,6 +3508,7 @@ mod tests {
            position_ms: u64::MAX,
          },
          from: None,
@@ -2847,7 +3091,7 @@ index ce29d65..ce854d5 100644
        },
      )
      .await;
-@@ -2824,20 +3519,23 @@ mod tests {
+@@ -2824,20 +3565,23 @@ mod tests {
  
    #[cfg(feature = "streaming")]
    #[tokio::test]
@@ -2873,7 +3117,7 @@ index ce29d65..ce854d5 100644
    }
  
    #[tokio::test]
-@@ -2854,6 +3552,7 @@ mod tests {
+@@ -2854,6 +3598,7 @@ mod tests {
      relay(
        &mut network,
        sync::SyncMessage::GuestJoined {
@@ -2881,8 +3125,16 @@ index ce29d65..ce854d5 100644
          name: "Guest".to_string(),
        },
      )
+@@ -2870,6 +3615,7 @@ mod tests {
+     );
+   }
+ 
++  #[cfg(not(feature = "youtube"))]
+   #[tokio::test]
+   async fn party_auth_status_uses_app_language_without_holding_the_lock() {
+     use crate::core::i18n::Language;
 diff --git a/src/infra/network/sync.rs b/src/infra/network/sync.rs
-index 9be9587..9a3fb6c 100644
+index 9be9587..7a398cd 100644
 --- a/src/infra/network/sync.rs
 +++ b/src/infra/network/sync.rs
 @@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
@@ -3241,7 +3493,7 @@ index 9be9587..9a3fb6c 100644
 +        from_id: None,
 +        base_rev: 0,
 +        action: crate::core::party::QueueAction::Add {
-+          uri: "spotify:track:7o2AeQZzfCERsRmOM86EcB".into(),
++          uri: "youtube:dQw4w9WgXcQ".into(),
 +          title: "Archangel".into(),
 +          artists: vec!["Burial".into()],
 +          duration_ms: 299_000,

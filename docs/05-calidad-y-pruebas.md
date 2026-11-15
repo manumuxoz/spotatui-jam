@@ -27,7 +27,7 @@ Objetivo: que los bugs de estado y protocolo se detecten sin necesidad de dos cu
 | Test | Caso |
 |---|---|
 | `add_appends_item` | Add válido al final; revisión +1 |
-| `add_rejects_bad_uri` | `http://`, `spotify:album:`, vacío, `spotify:track:` sin id |
+| `add_rejects_bad_uri` | `http://`, `youtube:playlist:`, vacío, `youtube:` sin id |
 | `add_rejects_duplicate` | Mismo URI con `dedupe=true` |
 | `add_allows_duplicate_when_disabled` | `dedupe=false` |
 | `add_rejects_queue_full` | 100 items |

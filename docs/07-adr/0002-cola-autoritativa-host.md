@@ -21,7 +21,7 @@ El host es la autoridad. `PartyQueue` contiene `current`, `items`, `history`, ID
 
 - Un único punto de mutación (`apply_party_op`) actualiza ambos.
 - El hook de `AdvanceNativeQueue` es obligatorio; sin él, los items consumidos quedan fantasma.
-- Los tracks no Spotify se rechazan en la cola v1.
+- Los elementos que no son vídeos de YouTube se rechazan en la cola v1.
 - Al iniciar la jam, la `native_queue` existente se adopta o se vacía (configurable).
 - Los tests de propiedad comparan `PartyQueue` y `native_queue` tras secuencias aleatorias.
 
